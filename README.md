@@ -6,23 +6,34 @@ there is **no scraping, polling, or cron job**.
 
 ```
 Newsletter email
-      │  (forwarded)
+      │  (forwarded to your SendGrid Inbound Parse address)
       ▼
-Postmark inbound stream ──POST──▶ /api/email/inbound
-                                      │ dedupe (Supabase)
-                                      │ summarize (OpenRouter → Claude Sonnet 4.5)
-                                      │ fan out DMs (Slack chat.postMessage)
-                                      ▼
-                                  Subscribers
+SendGrid Inbound Parse ──POST──▶ /api/email/inbound
+                                     │ dedupe (Supabase)
+                                     │ summarize (OpenRouter → Claude Sonnet 4.5)
+                                     │ fan out DMs (Slack chat.postMessage)
+                                     ▼
+                                 Subscribers
 
 Slack DM "subscribe" ──▶ /api/slack/events ──▶ insert/delete in Supabase
 ```
+
+## Before you start: requirements
+
+- **A domain you control with DNS access.** SendGrid Inbound Parse receives
+  mail on a subdomain of your own domain (e.g. `parse.yourdomain.com`) via an MX
+  record — it does not give you a ready-made inbound address. If you can't edit
+  DNS for a domain, this setup won't work; use Postmark Pro or Cloudflare Email
+  Routing instead.
+- Free accounts for Supabase, SendGrid, OpenRouter (small credit needed), and a
+  Slack workspace where you can install an app.
 
 ## Project structure
 
 ```
 app/api/email/inbound/route.ts   Inbound email handler (dedupe, summarize, DM)
 app/api/slack/events/route.ts    Slack DM handler (subscribe/unsubscribe)
+app/layout.tsx, app/page.tsx     Next.js boilerplate (no real UI)
 lib/supabase.ts                  Supabase service-role client singleton
 lib/slack.ts                     sendSlackDM + verifySlackSignature helpers
 vercel.json                      Minimal config (function timeout, no cron)
@@ -33,7 +44,9 @@ package.json / tsconfig.json     Project + TypeScript config (@/ → project roo
 
 ## 1. Supabase
 
-Create a project at https://supabase.com, then run this in the SQL editor:
+Create a project at https://supabase.com, then run this in the SQL editor
+(choose **Run and enable RLS** if prompted — the server uses the service-role
+key, which bypasses RLS):
 
 ```sql
 -- Tracks processed emails to prevent duplicate sends
@@ -52,35 +65,16 @@ create table subscribers (
 );
 ```
 
-From **Project Settings → API**, copy the **Project URL** and the
-**`service_role`** key (server-side only — never expose it to the browser).
+From **Project Settings → API**, copy the **Project URL** (`SUPABASE_URL`) and
+the **`service_role`** secret key (`SUPABASE_SERVICE_ROLE_KEY` — server-side
+only, never expose it to the browser).
 
 ---
 
-## 2. Postmark (inbound email)
+## 2. OpenRouter
 
-1. Sign up at https://postmarkapp.com and create a new **Inbound Stream**
-   (not a sending stream).
-2. Copy the generated inbound address (e.g. `abc123@inbound.postmarkapp.com`).
-3. Set the stream's **Webhook URL** to:
-
-   ```
-   https://<your-vercel-domain>/api/email/inbound?token=<POSTMARK_WEBHOOK_TOKEN>
-   ```
-
-   Postmark does **not** HMAC-sign inbound webhooks, so the endpoint is secured
-   with a shared secret. Pick any long random string for
-   `POSTMARK_WEBHOOK_TOKEN` and append it as the `?token=` query parameter on
-   the webhook URL above. (Alternatively send it as an
-   `X-Postmark-Webhook-Token` header.) Requests without the correct token get a
-   `403`.
-4. **Forward the newsletter to the Postmark address.** Either:
-   - Add a forwarding rule in Gmail/Outlook that forwards each Activant research
-     newsletter to the inbound address, **or**
-   - Subscribe the inbound address to the newsletter directly.
-
-The moment a newsletter lands, Postmark parses it and POSTs the JSON payload to
-the webhook in real time.
+At https://openrouter.ai create an API key (`OPENROUTER_API_KEY`) and add a
+little credit so the summarization model can run.
 
 ---
 
@@ -88,32 +82,52 @@ the webhook in real time.
 
 Create an app at https://api.slack.com/apps.
 
-**Bot Token Scopes** (OAuth & Permissions):
+**Bot Token Scopes** (OAuth & Permissions): `chat:write`, `im:history`,
+`im:write`, `users:read`.
 
-| Scope | Why |
-|---|---|
-| `chat:write` | Send DMs |
-| `im:history` | Read DMs sent to the bot |
-| `im:write` | Open DM channels with users |
-| `users:read` | Resolve user info if needed |
+Install the app to your workspace, then copy the **Bot User OAuth Token**
+(`xoxb-…` → `SLACK_BOT_TOKEN`) and, from **Basic Information**, the **Signing
+Secret** (`SLACK_SIGNING_SECRET`).
 
-**Event Subscriptions:**
-- Enable events and set the **Request URL** to
-  `https://<your-vercel-domain>/api/slack/events`. Slack sends a one-time
-  `url_verification` challenge — the route answers it automatically, so the URL
-  verifies as soon as it's deployed.
-- Under **Subscribe to bot events**, add `message.im`.
-
-Install the app to your workspace, then from **Basic Information** /
-**OAuth & Permissions** copy the **Bot User OAuth Token** (`xoxb-…`) and the
-**Signing Secret**.
+**Event Subscriptions** (set the Request URL after you have a Vercel domain):
+- Request URL: `https://<your-vercel-domain>/api/slack/events`
+- Subscribe to bot event: `message.im`
 
 ---
 
-## 4. Environment variables
+## 4. SendGrid Inbound Parse
 
-Set these in Vercel (**Project → Settings → Environment Variables**) and in a
-local `.env.local` for development:
+SendGrid receives the newsletter and POSTs it to the webhook. It does **not**
+sign the request, so the endpoint is secured with a secret you invent and put in
+the URL.
+
+1. Sign up at https://sendgrid.com (free tier includes Inbound Parse).
+2. **Authenticate your domain**: Settings → Sender Authentication →
+   Authenticate Your Domain. Add the CNAME records it gives you at your DNS
+   provider and verify.
+3. Pick a secret string for `SENDGRID_INBOUND_TOKEN` (any long random value) and
+   save it.
+4. **Inbound Parse**: Settings → Inbound Parse → Add Host & URL.
+   - **Receiving domain**: a subdomain you'll use for mail, e.g. subdomain
+     `parse`, domain `yourdomain.com` → `parse.yourdomain.com`.
+   - **Destination URL**:
+     `https://<your-vercel-domain>/api/email/inbound?token=<SENDGRID_INBOUND_TOKEN>`
+   - Leave **"POST the raw, full MIME message"** unchecked (we rely on the
+     parsed `text` / `html` / `subject` / `headers` fields).
+5. **Add the MX record** at your DNS provider for the receiving subdomain:
+   - Host/name: `parse` (i.e. `parse.yourdomain.com`)
+   - Type: `MX`, Priority: `10`, Value: `mx.sendgrid.net`
+6. **Forward the newsletter** to any address at that subdomain (e.g.
+   `news@parse.yourdomain.com`) — set a forwarding rule in Gmail/Outlook, or
+   subscribe that address to the newsletter directly. Any mail to that subdomain
+   gets parsed and POSTed to your webhook.
+
+---
+
+## 5. Environment variables
+
+Set these in Vercel (**Project → Settings → Environment Variables**) and, for
+local dev, in a `.env.local` file (see `.env.example`):
 
 ```
 SUPABASE_URL=
@@ -121,31 +135,27 @@ SUPABASE_SERVICE_ROLE_KEY=
 OPENROUTER_API_KEY=
 SLACK_BOT_TOKEN=
 SLACK_SIGNING_SECRET=
-POSTMARK_WEBHOOK_TOKEN=
+SENDGRID_INBOUND_TOKEN=
 ```
 
-Get the OpenRouter key at https://openrouter.ai/keys.
+`SENDGRID_INBOUND_TOKEN` must be the exact same string you appended as `?token=`
+on the SendGrid destination URL.
 
 ---
 
-## 5. Install & deploy
+## 6. Install & deploy
 
-This project assumes a Next.js App Router project at the repo root (the `@/`
-import alias maps to the project root via `tsconfig.json`). If you're starting
-fresh, scaffold with `npx create-next-app@latest` and drop these files in.
+This is a Next.js App Router project; the `@/` import alias maps to the project
+root via `tsconfig.json`.
 
 ```bash
 npm install @supabase/supabase-js @vercel/functions cheerio
-npm install            # install everything from package.json
-vercel --prod          # deploy
+npm install          # install everything from package.json
+vercel --prod        # deploy
 ```
 
-> `@vercel/functions` provides `waitUntil`, which lets the Slack route
-> acknowledge within Slack's 3-second window while finishing the
-> Supabase/Slack work afterwards.
-
-After the first deploy, plug your real Vercel domain into the Postmark webhook
-URL and the Slack Request URL.
+After the first deploy, plug your real Vercel domain into the SendGrid
+destination URL and the Slack Request URL.
 
 ---
 
@@ -167,14 +177,17 @@ When a newsletter arrives, every subscriber receives:
 
 ## Design notes
 
-- **No double-sends.** The inbound route *claims* each `MessageID` by inserting
-  it into `processed_emails` before doing any work; the unique constraint makes
-  a Postmark retry a no-op. If summarization or fan-out then fails, the claim is
+- **No double-sends.** The inbound route derives a stable message id (the
+  email's RFC `Message-ID`, or a hash of subject+body if absent) and *claims* it
+  in `processed_emails` before doing any work; the unique constraint makes a
+  SendGrid retry a no-op. If summarization or fan-out then fails, the claim is
   released so the retry can re-run the full job.
+- **SendGrid posts form-data.** The route reads `multipart/form-data` fields
+  (`text`, `html`, `subject`, `headers`) rather than JSON. It prefers `text` and
+  falls back to stripping `html` with cheerio.
 - **Resilient fan-out.** A failure delivering one subscriber's DM is logged and
   skipped — it never aborts the rest.
-- **Body extraction.** The summarizer prefers `TextBody`; if it's missing or
-  very short, it falls back to stripping `HtmlBody` with cheerio.
-- **Security.** Postmark requests are checked against a shared token; Slack
+- **Security.** SendGrid Inbound Parse isn't signable, so requests are checked
+  against a shared `?token=` secret with constant-time comparison. Slack
   requests are verified with HMAC-SHA256 over the raw body plus a 5-minute
-  timestamp window. Both use constant-time comparison.
+  timestamp window.

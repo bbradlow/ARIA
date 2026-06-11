@@ -10,6 +10,14 @@ export const dynamic = "force-dynamic";
 // Summarization + fan-out can take a while; give the function headroom.
 export const maxDuration = 60;
 
+interface PostmarkInbound {
+  MessageID?: string;
+  Subject?: string;
+  TextBody?: string;
+  HtmlBody?: string;
+  StrippedTextReply?: string;
+}
+
 function timingSafeEqualStr(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
@@ -18,15 +26,19 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 }
 
 /**
- * SendGrid Inbound Parse does not sign its webhooks, so we secure this endpoint
- * with a shared secret carried in the destination URL's query string
- * (?token=...). Configure that full URL in SendGrid -> Settings -> Inbound
- * Parse. Requests with a missing or wrong token get a 403.
+ * Postmark does not HMAC-sign inbound webhooks, so we secure this endpoint with
+ * a shared secret. The token can be supplied either as a `?token=` query
+ * parameter (recommended — configure it on the Postmark webhook URL) or via an
+ * `X-Postmark-Webhook-Token` header.
  */
-function verifyToken(req: NextRequest): boolean {
-  const expected = process.env.SENDGRID_INBOUND_TOKEN;
+function verifyPostmark(req: NextRequest): boolean {
+  const expected = process.env.POSTMARK_WEBHOOK_TOKEN;
   if (!expected) return false;
-  const provided = req.nextUrl.searchParams.get("token");
+
+  const provided =
+    req.nextUrl.searchParams.get("token") ??
+    req.headers.get("x-postmark-webhook-token");
+
   if (!provided) return false;
   return timingSafeEqualStr(provided, expected);
 }
@@ -45,31 +57,15 @@ function htmlToText(html: string): string {
  * Prefer the clean plain-text body. Fall back to stripping the HTML body when
  * the text version is empty or suspiciously short.
  */
-function extractBody(text: string, html: string): string {
-  const t = text.trim();
-  if (t.length >= 200) return t;
-  if (html && html.trim().length > 0) {
-    const stripped = htmlToText(html);
-    if (stripped.length > t.length) return stripped;
-  }
-  return t;
-}
+function extractBody(payload: PostmarkInbound): string {
+  const text = (payload.TextBody ?? "").trim();
+  if (text.length >= 200) return text;
 
-/**
- * SendGrid doesn't hand us a tidy unique id, so we pull the RFC `Message-ID`
- * out of the raw `headers` field. If it's missing, fall back to a stable hash
- * of the subject + body so retries of the same email still dedupe correctly.
- */
-function deriveMessageId(headers: string, subject: string, body: string): string {
-  const match = headers.match(/^Message-ID:\s*(.+)$/im);
-  if (match) return match[1].trim();
-  return (
-    "sha256:" +
-    crypto
-      .createHash("sha256")
-      .update(`${subject}\n${body.slice(0, 4000)}`)
-      .digest("hex")
-  );
+  if (payload.HtmlBody && payload.HtmlBody.trim().length > 0) {
+    const stripped = htmlToText(payload.HtmlBody);
+    if (stripped.length > text.length) return stripped;
+  }
+  return text;
 }
 
 async function summarize(title: string, body: string): Promise<string> {
@@ -111,38 +107,30 @@ async function summarize(title: string, body: string): Promise<string> {
 }
 
 export async function POST(req: NextRequest) {
-  // Verify the shared secret in the query string.
-  if (!verifyToken(req)) {
+  // Verify the request genuinely came from Postmark.
+  if (!verifyPostmark(req)) {
     return new Response("Forbidden", { status: 403 });
   }
 
-  // SendGrid Inbound Parse POSTs multipart/form-data, not JSON. The default
-  // "parsed" mode gives us individual fields (text, html, subject, headers...).
-  let form: FormData;
+  // Postmark POSTs a JSON object.
+  let payload: PostmarkInbound;
   try {
-    form = await req.formData();
+    payload = (await req.json()) as PostmarkInbound;
   } catch {
     return new Response("Bad Request", { status: 400 });
   }
 
-  const subject =
-    ((form.get("subject") as string) || "").trim() || "New Activant Research";
-  const text = (form.get("text") as string) || "";
-  const html = (form.get("html") as string) || "";
-  const headers = (form.get("headers") as string) || "";
-
-  const body = extractBody(text, html);
-  if (!body) {
-    // Nothing usable to summarize; ack so SendGrid doesn't keep retrying.
-    return Response.json({ status: "empty", subscribers_notified: 0 });
+  const messageId = payload.MessageID;
+  if (!messageId) {
+    return new Response("Missing MessageID", { status: 400 });
   }
+  const subject = payload.Subject?.trim() || "New Activant Research";
 
-  const messageId = deriveMessageId(headers, subject, body);
   const supabase = getSupabase();
 
   // Deduplicate by atomically *claiming* the message id up front. The unique
   // constraint on `message_id` means a duplicate insert fails — that failure is
-  // our signal the email was already processed (e.g. a SendGrid retry), so we
+  // our signal the email was already processed (e.g. a Postmark retry), so we
   // ack with 200 and do nothing. Claiming first (rather than check-then-insert)
   // closes the race where two concurrent retries both pass an existence check.
   const { error: claimError } = await supabase
@@ -159,6 +147,9 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    const body = extractBody(payload);
+    if (!body) throw new Error("Email had no usable body to summarize");
+
     // Summarize via OpenRouter.
     const summary = await summarize(subject, body);
 
@@ -184,7 +175,7 @@ export async function POST(req: NextRequest) {
     return Response.json({ status: "ok", subscribers_notified: notified });
   } catch (err) {
     // Processing failed *after* claiming the message. Release the claim so a
-    // SendGrid retry can re-attempt the full job, then signal failure.
+    // Postmark retry can re-attempt the full job, then signal failure.
     console.error("Processing failed, releasing claim:", err);
     await supabase.from("processed_emails").delete().eq("message_id", messageId);
     return new Response("Processing error", { status: 500 });

@@ -6,27 +6,24 @@ there is **no scraping, polling, or cron job**.
 
 ```
 Newsletter email
-      │  (forwarded to your SendGrid Inbound Parse address)
+      │  (forwarded to your Postmark inbound address)
       ▼
-SendGrid Inbound Parse ──POST──▶ /api/email/inbound
-                                     │ dedupe (Supabase)
-                                     │ summarize (OpenRouter → Claude Sonnet 4.5)
-                                     │ fan out DMs (Slack chat.postMessage)
-                                     ▼
-                                 Subscribers
+Postmark Inbound Stream ──POST──▶ /api/email/inbound
+                                      │ dedupe (Supabase)
+                                      │ summarize (OpenRouter → Claude Sonnet 4.5)
+                                      │ fan out DMs (Slack chat.postMessage)
+                                      ▼
+                                  Subscribers
 
 Slack DM "subscribe" ──▶ /api/slack/events ──▶ insert/delete in Supabase
 ```
 
-## Before you start: requirements
+## Heads-up on Postmark cost
 
-- **A domain you control with DNS access.** SendGrid Inbound Parse receives
-  mail on a subdomain of your own domain (e.g. `parse.yourdomain.com`) via an MX
-  record — it does not give you a ready-made inbound address. If you can't edit
-  DNS for a domain, this setup won't work; use Postmark Pro or Cloudflare Email
-  Routing instead.
-- Free accounts for Supabase, SendGrid, OpenRouter (small credit needed), and a
-  Slack workspace where you can install an app.
+Postmark's free Developer plan (100 emails/month) does **not** include inbound
+email processing — that feature is on the Pro plan ($16.50/mo) and Platform
+plan ($18/mo). Since this bot depends on receiving inbound mail, plan on Pro.
+Confirm current pricing at https://postmarkapp.com/pricing when you sign up.
 
 ## Project structure
 
@@ -45,8 +42,8 @@ package.json / tsconfig.json     Project + TypeScript config (@/ → project roo
 ## 1. Supabase
 
 Create a project at https://supabase.com, then run this in the SQL editor
-(choose **Run and enable RLS** if prompted — the server uses the service-role
-key, which bypasses RLS):
+(choose **Run and enable RLS** if prompted — the server uses the secret /
+service-role key, which bypasses RLS):
 
 ```sql
 -- Tracks processed emails to prevent duplicate sends
@@ -65,9 +62,11 @@ create table subscribers (
 );
 ```
 
-From **Project Settings → API**, copy the **Project URL** (`SUPABASE_URL`) and
-the **`service_role`** secret key (`SUPABASE_SERVICE_ROLE_KEY` — server-side
-only, never expose it to the browser).
+For `SUPABASE_URL`: Settings → Data API → Project URL (looks like
+`https://<project-ref>.supabase.co`), or the green **Connect** button.
+For `SUPABASE_SERVICE_ROLE_KEY`: Settings → API Keys → copy the **secret** key
+(`sb_secret_…`). Make sure the Data API is enabled with the `public` schema
+exposed (it is by default). Keep the secret key server-side only.
 
 ---
 
@@ -89,38 +88,34 @@ Install the app to your workspace, then copy the **Bot User OAuth Token**
 (`xoxb-…` → `SLACK_BOT_TOKEN`) and, from **Basic Information**, the **Signing
 Secret** (`SLACK_SIGNING_SECRET`).
 
+**App Home → Show Tabs**: enable the **Messages Tab** and check "Allow users to
+send Slash commands and messages from the messages tab" — otherwise users can't
+DM the bot.
+
 **Event Subscriptions** (set the Request URL after you have a Vercel domain):
 - Request URL: `https://<your-vercel-domain>/api/slack/events`
 - Subscribe to bot event: `message.im`
 
 ---
 
-## 4. SendGrid Inbound Parse
+## 4. Postmark Inbound
 
-SendGrid receives the newsletter and POSTs it to the webhook. It does **not**
-sign the request, so the endpoint is secured with a secret you invent and put in
-the URL.
+Postmark receives the newsletter and POSTs it to the webhook. It does **not**
+sign inbound requests, so the endpoint is secured with a secret you invent and
+put in the URL.
 
-1. Sign up at https://sendgrid.com (free tier includes Inbound Parse).
-2. **Authenticate your domain**: Settings → Sender Authentication →
-   Authenticate Your Domain. Add the CNAME records it gives you at your DNS
-   provider and verify.
-3. Pick a secret string for `SENDGRID_INBOUND_TOKEN` (any long random value) and
-   save it.
-4. **Inbound Parse**: Settings → Inbound Parse → Add Host & URL.
-   - **Receiving domain**: a subdomain you'll use for mail, e.g. subdomain
-     `parse`, domain `yourdomain.com` → `parse.yourdomain.com`.
-   - **Destination URL**:
-     `https://<your-vercel-domain>/api/email/inbound?token=<SENDGRID_INBOUND_TOKEN>`
-   - Leave **"POST the raw, full MIME message"** unchecked (we rely on the
-     parsed `text` / `html` / `subject` / `headers` fields).
-5. **Add the MX record** at your DNS provider for the receiving subdomain:
-   - Host/name: `parse` (i.e. `parse.yourdomain.com`)
-   - Type: `MX`, Priority: `10`, Value: `mx.sendgrid.net`
-6. **Forward the newsletter** to any address at that subdomain (e.g.
-   `news@parse.yourdomain.com`) — set a forwarding rule in Gmail/Outlook, or
-   subscribe that address to the newsletter directly. Any mail to that subdomain
-   gets parsed and POSTed to your webhook.
+1. Sign up at https://postmarkapp.com (inbound needs the Pro plan — see above)
+   and create a new **Inbound Stream** (not a sending stream).
+2. Copy the inbound email address it gives you (e.g.
+   `abc123@inbound.postmarkapp.com`).
+3. Pick a secret string for `POSTMARK_WEBHOOK_TOKEN` (any long random value).
+4. In the Inbound Stream settings, set the **Webhook URL** to:
+   `https://<your-vercel-domain>/api/email/inbound?token=<POSTMARK_WEBHOOK_TOKEN>`
+5. **Forward the newsletter** to the Postmark inbound address — set a forwarding
+   rule in Gmail/Outlook, or subscribe that address to the newsletter directly.
+
+Unlike SendGrid, Postmark gives you a ready-made inbound address, so there's no
+domain or MX-record setup required.
 
 ---
 
@@ -135,11 +130,11 @@ SUPABASE_SERVICE_ROLE_KEY=
 OPENROUTER_API_KEY=
 SLACK_BOT_TOKEN=
 SLACK_SIGNING_SECRET=
-SENDGRID_INBOUND_TOKEN=
+POSTMARK_WEBHOOK_TOKEN=
 ```
 
-`SENDGRID_INBOUND_TOKEN` must be the exact same string you appended as `?token=`
-on the SendGrid destination URL.
+`POSTMARK_WEBHOOK_TOKEN` must be the exact same string you appended as `?token=`
+on the Postmark webhook URL.
 
 ---
 
@@ -154,8 +149,8 @@ npm install          # install everything from package.json
 vercel --prod        # deploy
 ```
 
-After the first deploy, plug your real Vercel domain into the SendGrid
-destination URL and the Slack Request URL.
+After the first deploy, plug your real Vercel domain into the Postmark webhook
+URL and the Slack Request URL.
 
 ---
 
@@ -177,17 +172,14 @@ When a newsletter arrives, every subscriber receives:
 
 ## Design notes
 
-- **No double-sends.** The inbound route derives a stable message id (the
-  email's RFC `Message-ID`, or a hash of subject+body if absent) and *claims* it
-  in `processed_emails` before doing any work; the unique constraint makes a
-  SendGrid retry a no-op. If summarization or fan-out then fails, the claim is
+- **No double-sends.** The inbound route *claims* each `MessageID` in
+  `processed_emails` before doing any work; the unique constraint makes a
+  Postmark retry a no-op. If summarization or fan-out then fails, the claim is
   released so the retry can re-run the full job.
-- **SendGrid posts form-data.** The route reads `multipart/form-data` fields
-  (`text`, `html`, `subject`, `headers`) rather than JSON. It prefers `text` and
-  falls back to stripping `html` with cheerio.
+- **Body extraction.** The summarizer prefers `TextBody`; if it's missing or
+  very short, it falls back to stripping `HtmlBody` with cheerio.
 - **Resilient fan-out.** A failure delivering one subscriber's DM is logged and
   skipped — it never aborts the rest.
-- **Security.** SendGrid Inbound Parse isn't signable, so requests are checked
-  against a shared `?token=` secret with constant-time comparison. Slack
-  requests are verified with HMAC-SHA256 over the raw body plus a 5-minute
-  timestamp window.
+- **Security.** Postmark requests are checked against a shared `?token=` secret
+  with constant-time comparison. Slack requests are verified with HMAC-SHA256
+  over the raw body plus a 5-minute timestamp window.

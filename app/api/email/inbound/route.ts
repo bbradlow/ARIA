@@ -72,6 +72,14 @@ async function summarize(title: string, body: string): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error("Missing OPENROUTER_API_KEY environment variable");
 
+  // The summary instructions and model are configurable via env vars, so you
+  // can tune them in the Vercel dashboard without editing code. They fall back
+  // to these defaults when unset.
+  const defaultPrompt =
+    "You are a research analyst assistant. Given the full text of a research newsletter email, produce a concise 3-5 sentence executive summary suitable for a Slack DM to a team of investors. Highlight the core thesis, key data points, and takeaway. Do not include any preamble or sign-off — just the summary.";
+  const systemPrompt = process.env.SUMMARY_SYSTEM_PROMPT?.trim() || defaultPrompt;
+  const model = process.env.SUMMARY_MODEL?.trim() || "anthropic/claude-sonnet-4-5";
+
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -81,13 +89,9 @@ async function summarize(title: string, body: string): Promise<string> {
       "X-Title": "Activant Research Bot",
     },
     body: JSON.stringify({
-      model: "anthropic/claude-sonnet-4-5",
+      model,
       messages: [
-        {
-          role: "system",
-          content:
-            "You are a research analyst assistant. Given the full text of a research newsletter email, produce a concise 3-5 sentence executive summary suitable for a Slack DM to a team of investors. Highlight the core thesis, key data points, and takeaway. Do not include any preamble or sign-off — just the summary.",
-        },
+        { role: "system", content: systemPrompt },
         { role: "user", content: `Title: ${title}\n\n${body}` },
       ],
     }),

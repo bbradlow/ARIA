@@ -17,10 +17,6 @@ const HELP_REPLY =
   "• Type `unsubscribe` to stop.";
 const CHANNEL_WELCOME =
   "👋 I'll post a summary in this channel whenever a new Activant Capital research newsletter is published. Remove me from the channel to stop.";
-const GROUP_WELCOME =
-  "👋 Added! I'll post a summary in this group whenever a new Activant Capital research newsletter is published. Type `stop` here to turn it off.";
-const GROUP_STOP_REPLY =
-  "👋 Done — I'll stop posting research summaries in this group.";
 
 interface SlackEvent {
   type?: string;
@@ -72,33 +68,71 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
 }
 
 // Multi-person DM (group chat). There's no "added to mpim" event, so we
-// register the group the first time we see a message in it, and post a one-time
-// welcome. Anyone can type `stop` to deregister it.
+// register the group the first time we see a message in it. To avoid casual
+// chatter toggling the bot, the stop/start commands must @mention the bot;
+// pausing is durable (active=false) and only an explicit start resumes it.
 async function handleGroupMessage(event: SlackEvent): Promise<void> {
   if (event.bot_id || event.subtype) return;
   if (!event.channel) return;
 
-  const command = (event.text ?? "").trim().toLowerCase();
+  let botUserId: string;
+  try {
+    botUserId = await getBotUserId();
+  } catch (err) {
+    console.error("Could not resolve bot user id:", err);
+    return;
+  }
+
+  const raw = event.text ?? "";
+  const lower = raw.toLowerCase();
+  const mentioned = raw.includes(`<@${botUserId}>`);
+  const wantsStop = /\b(stop|unsubscribe|leave|pause)\b/.test(lower);
+  const wantsStart = /\b(start|subscribe|resume|begin)\b/.test(lower);
+
+  const channel = event.channel;
   const supabase = getSupabase();
+  const welcome =
+    `👋 I'll post a summary in this group whenever a new Activant Capital research ` +
+    `newsletter is published. To pause me, mention me with "stop" (e.g. <@${botUserId}> stop); ` +
+    `mention me with "start" to resume.`;
 
   try {
-    if (command === "stop" || command === "unsubscribe" || command === "leave") {
+    // Commands must @mention the bot — so someone typing "stop" mid-conversation
+    // never accidentally toggles anything.
+    if (mentioned && wantsStop) {
       const { error } = await supabase
         .from("channels")
-        .delete()
-        .eq("slack_channel_id", event.channel);
+        .upsert(
+          { slack_channel_id: channel, active: false },
+          { onConflict: "slack_channel_id" }
+        );
       if (error) throw error;
-      await postSlackMessage(event.channel, GROUP_STOP_REPLY);
+      await postSlackMessage(
+        channel,
+        '👋 Paused — I\'ll stop posting here. Mention me with "start" to resume.'
+      );
+      return;
+    }
+    if (mentioned && wantsStart) {
+      const { error } = await supabase
+        .from("channels")
+        .upsert(
+          { slack_channel_id: channel, active: true },
+          { onConflict: "slack_channel_id" }
+        );
+      if (error) throw error;
+      await postSlackMessage(channel, welcome);
       return;
     }
 
-    // Register on first sight; welcome only when newly inserted (so we don't
-    // greet on every message). A unique-violation means it's already known.
+    // Not a command: auto-register on first sight only. If a row already exists
+    // (active or paused), leave its state untouched — chatter never reactivates
+    // a paused group.
     const { error } = await supabase
       .from("channels")
-      .insert({ slack_channel_id: event.channel });
+      .insert({ slack_channel_id: channel, active: true });
     if (!error) {
-      await postSlackMessage(event.channel, GROUP_WELCOME);
+      await postSlackMessage(channel, welcome);
     } else if ((error as { code?: string }).code !== "23505") {
       throw error;
     }
@@ -130,8 +164,8 @@ async function handleChannelMembership(
       const { error } = await supabase
         .from("channels")
         .upsert(
-          { slack_channel_id: event.channel },
-          { onConflict: "slack_channel_id", ignoreDuplicates: true }
+          { slack_channel_id: event.channel, active: true },
+          { onConflict: "slack_channel_id" }
         );
       if (error) throw error;
       await postSlackMessage(event.channel, CHANNEL_WELCOME);
@@ -153,7 +187,6 @@ async function handleEvent(event: SlackEvent): Promise<void> {
       if (event.channel_type === "mpim") {
         await handleGroupMessage(event);
       } else {
-        // "im" — a 1:1 DM with the bot.
         await handleDirectMessage(event);
       }
       break;
@@ -188,7 +221,6 @@ export async function POST(req: NextRequest) {
     return Response.json({ challenge: envelope.challenge });
   }
 
-  // Ack Slack retries immediately and skip reprocessing.
   if (req.headers.get("x-slack-retry-num")) {
     return new Response("ok", { status: 200 });
   }

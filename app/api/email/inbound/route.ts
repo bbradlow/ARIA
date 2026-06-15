@@ -204,7 +204,8 @@ export async function POST(req: NextRequest) {
     let channelsNotified = 0;
     const { data: chans, error: chansError } = await supabase
       .from("channels")
-      .select("slack_channel_id");
+      .select("slack_channel_id")
+      .eq("active", true);
     if (chansError) throw chansError;
     for (const ch of chans ?? []) {
       try {

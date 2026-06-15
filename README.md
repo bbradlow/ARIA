@@ -61,16 +61,24 @@ create table subscribers (
   subscribed_at timestamptz default now()
 );
 
--- Tracks channels the bot has been added to (group posting)
+-- Tracks channels and group DMs the bot posts to.
+-- active = false means it's been paused (via an @mention "stop" in a group).
 create table channels (
   id uuid primary key default gen_random_uuid(),
   slack_channel_id text unique not null,
+  active boolean not null default true,
   added_at timestamptz default now()
 );
 ```
 
-If you already created the first two tables, just run the `channels` block on
-its own to add the new feature.
+If you already created the `channels` table from the previous version, just add
+the new column instead:
+
+```sql
+alter table channels add column active boolean not null default true;
+```
+
+If you haven't created any of these yet, run the whole block above.
 
 For `SUPABASE_URL`: Settings → Data API → Project URL (looks like
 `https://<project-ref>.supabase.co`), or the green **Connect** button.
@@ -181,9 +189,11 @@ URL and the Slack Request URL.
   channel and posts every future summary there too. Remove it from the channel
   to stop. Private channels work if you invite the bot directly.
 - **Add the bot to a group DM** → once someone sends any message in the group,
-  the bot registers it and starts posting summaries there. Type `stop` in the
-  group to turn it off. (Group DMs have no "added" event, so a first message is
-  what activates it.)
+  the bot registers it and starts posting summaries there. To pause it,
+  **@mention the bot with "stop"** (e.g. `@ARIA stop`); mention it with "start"
+  to resume. Pausing is durable — a paused group stays off until someone
+  explicitly starts it, and casual use of the word "stop" in conversation does
+  nothing (the command must @mention the bot).
 
 When a newsletter arrives, every subscriber, channel, and group DM receives:
 

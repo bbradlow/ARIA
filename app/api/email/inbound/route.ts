@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import * as cheerio from "cheerio";
 import crypto from "crypto";
 import { getSupabase } from "@/lib/supabase";
-import { sendSlackDM } from "@/lib/slack";
+import { postSlackMessage } from "@/lib/slack";
 
 // cheerio + node crypto require the Node.js runtime (not Edge).
 export const runtime = "nodejs";
@@ -27,18 +27,15 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 
 /**
  * Postmark does not HMAC-sign inbound webhooks, so we secure this endpoint with
- * a shared secret. The token can be supplied either as a `?token=` query
- * parameter (recommended — configure it on the Postmark webhook URL) or via an
- * `X-Postmark-Webhook-Token` header.
+ * a shared secret supplied as a `?token=` query parameter (configured on the
+ * Postmark webhook URL) or an `X-Postmark-Webhook-Token` header.
  */
 function verifyPostmark(req: NextRequest): boolean {
   const expected = process.env.POSTMARK_WEBHOOK_TOKEN;
   if (!expected) return false;
-
   const provided =
     req.nextUrl.searchParams.get("token") ??
     req.headers.get("x-postmark-webhook-token");
-
   if (!provided) return false;
   return timingSafeEqualStr(provided, expected);
 }
@@ -53,14 +50,9 @@ function htmlToText(html: string): string {
     .trim();
 }
 
-/**
- * Prefer the clean plain-text body. Fall back to stripping the HTML body when
- * the text version is empty or suspiciously short.
- */
 function extractBody(payload: PostmarkInbound): string {
   const text = (payload.TextBody ?? "").trim();
   if (text.length >= 200) return text;
-
   if (payload.HtmlBody && payload.HtmlBody.trim().length > 0) {
     const stripped = htmlToText(payload.HtmlBody);
     if (stripped.length > text.length) return stripped;
@@ -68,15 +60,51 @@ function extractBody(payload: PostmarkInbound): string {
   return text;
 }
 
+/**
+ * Best-effort extraction of the "read the full article" link. Prefers a link
+ * whose anchor text hints at the article ("read more", "full", "view online"),
+ * then any activantcapital.com link, then any link — skipping obvious junk
+ * (unsubscribe, social, images). Falls back to scanning the plain text.
+ */
+function extractArticleUrl(html: string, text: string): string | null {
+  const isJunk = (h: string) =>
+    /unsubscribe|mailto:|utm_source=footer|list-manage|twitter\.com|x\.com|linkedin\.com|facebook\.com|instagram\.com|youtube\.com|\.png|\.jpe?g|\.gif/i.test(
+      h
+    );
+  const isHttp = (h: string) => /^https?:\/\//i.test(h);
+
+  if (html && html.trim().length > 0) {
+    const $ = cheerio.load(html);
+    const links: { href: string; text: string }[] = [];
+    $("a[href]").each((_, el) => {
+      links.push({
+        href: ($(el).attr("href") || "").trim(),
+        text: $(el).text().trim().toLowerCase(),
+      });
+    });
+    const cue = /(read|full|view|article|continue|more|online)/;
+    const cued = links.find((l) => cue.test(l.text) && isHttp(l.href) && !isJunk(l.href));
+    if (cued) return cued.href;
+    const site = links.find((l) => /activantcapital\.com/i.test(l.href) && !isJunk(l.href));
+    if (site) return site.href;
+    const any = links.find((l) => isHttp(l.href) && !isJunk(l.href));
+    if (any) return any.href;
+  }
+
+  const siteMatch = text.match(/https?:\/\/[^\s)>\]]*activantcapital\.com[^\s)>\]]*/i);
+  if (siteMatch) return siteMatch[0];
+  const anyMatch = text.match(/https?:\/\/[^\s)>\]]+/i);
+  return anyMatch ? anyMatch[0] : null;
+}
+
 async function summarize(title: string, body: string): Promise<string> {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error("Missing OPENROUTER_API_KEY environment variable");
 
-  // The summary instructions and model are configurable via env vars, so you
-  // can tune them in the Vercel dashboard without editing code. They fall back
-  // to these defaults when unset.
+  // The instructions and model are configurable via env vars so you can tune
+  // them in the Vercel dashboard without editing code.
   const defaultPrompt =
-    "You are a research analyst assistant. Given the full text of a research newsletter email, produce a concise 3-5 sentence executive summary suitable for a Slack DM to a team of investors. Highlight the core thesis, key data points, and takeaway. Do not include any preamble or sign-off — just the summary.";
+    "You are a research analyst assistant. Given the full text of a research newsletter email, produce a concise 3-5 sentence executive summary suitable for a Slack message to a team of investors. Highlight the core thesis, key data points, and takeaway. Do not include any preamble or sign-off — just the summary.";
   const systemPrompt = process.env.SUMMARY_SYSTEM_PROMPT?.trim() || defaultPrompt;
   const model = process.env.SUMMARY_MODEL?.trim() || "anthropic/claude-sonnet-4-5";
 
@@ -111,12 +139,10 @@ async function summarize(title: string, body: string): Promise<string> {
 }
 
 export async function POST(req: NextRequest) {
-  // Verify the request genuinely came from Postmark.
   if (!verifyPostmark(req)) {
     return new Response("Forbidden", { status: 403 });
   }
 
-  // Postmark POSTs a JSON object.
   let payload: PostmarkInbound;
   try {
     payload = (await req.json()) as PostmarkInbound;
@@ -132,19 +158,14 @@ export async function POST(req: NextRequest) {
 
   const supabase = getSupabase();
 
-  // Deduplicate by atomically *claiming* the message id up front. The unique
-  // constraint on `message_id` means a duplicate insert fails — that failure is
-  // our signal the email was already processed (e.g. a Postmark retry), so we
-  // ack with 200 and do nothing. Claiming first (rather than check-then-insert)
-  // closes the race where two concurrent retries both pass an existence check.
+  // Claim the message id up front (atomic dedup via the unique constraint).
   const { error: claimError } = await supabase
     .from("processed_emails")
     .insert({ message_id: messageId, subject });
 
   if (claimError) {
-    // 23505 = unique_violation -> already processed.
     if ((claimError as { code?: string }).code === "23505") {
-      return Response.json({ status: "duplicate", subscribers_notified: 0 });
+      return Response.json({ status: "duplicate", subscribers_notified: 0, channels_notified: 0 });
     }
     console.error("Failed to claim message:", claimError);
     return new Response("Database error", { status: 500 });
@@ -154,32 +175,52 @@ export async function POST(req: NextRequest) {
     const body = extractBody(payload);
     if (!body) throw new Error("Email had no usable body to summarize");
 
-    // Summarize via OpenRouter.
     const summary = await summarize(subject, body);
 
-    // Fan out to every subscriber.
+    // Append the "read the full article" link in code (reliable — the model
+    // never sees or rewrites the URL). Slack renders <url|label> as a link.
+    const articleUrl = extractArticleUrl(payload.HtmlBody ?? "", body);
+    let message = `📄 *${subject}*\n\n${summary}`;
+    if (articleUrl) {
+      message += `\n\n<${articleUrl}|Read the full piece →>`;
+    }
+
+    // Fan out to individual subscribers.
+    let subscribersNotified = 0;
     const { data: subs, error: subsError } = await supabase
       .from("subscribers")
       .select("slack_user_id");
     if (subsError) throw subsError;
-
-    const message = `📄 *${subject}*\n\n${summary}`;
-    let notified = 0;
-
     for (const sub of subs ?? []) {
       try {
-        await sendSlackDM(sub.slack_user_id, message);
-        notified += 1;
+        await postSlackMessage(sub.slack_user_id, message);
+        subscribersNotified += 1;
       } catch (err) {
-        // A single failed DM must never abort the whole fan-out.
         console.error(`Failed to DM ${sub.slack_user_id}:`, err);
       }
     }
 
-    return Response.json({ status: "ok", subscribers_notified: notified });
+    // Fan out to channels and group DMs the bot has been added to.
+    let channelsNotified = 0;
+    const { data: chans, error: chansError } = await supabase
+      .from("channels")
+      .select("slack_channel_id");
+    if (chansError) throw chansError;
+    for (const ch of chans ?? []) {
+      try {
+        await postSlackMessage(ch.slack_channel_id, message);
+        channelsNotified += 1;
+      } catch (err) {
+        console.error(`Failed to post to channel ${ch.slack_channel_id}:`, err);
+      }
+    }
+
+    return Response.json({
+      status: "ok",
+      subscribers_notified: subscribersNotified,
+      channels_notified: channelsNotified,
+    });
   } catch (err) {
-    // Processing failed *after* claiming the message. Release the claim so a
-    // Postmark retry can re-attempt the full job, then signal failure.
     console.error("Processing failed, releasing claim:", err);
     await supabase.from("processed_emails").delete().eq("message_id", messageId);
     return new Response("Processing error", { status: 500 });

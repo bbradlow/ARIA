@@ -54,13 +54,23 @@ create table processed_emails (
   processed_at timestamptz default now()
 );
 
--- Tracks subscribed Slack users
+-- Tracks subscribed Slack users (individual DMs)
 create table subscribers (
   id uuid primary key default gen_random_uuid(),
   slack_user_id text unique not null,
   subscribed_at timestamptz default now()
 );
+
+-- Tracks channels the bot has been added to (group posting)
+create table channels (
+  id uuid primary key default gen_random_uuid(),
+  slack_channel_id text unique not null,
+  added_at timestamptz default now()
+);
 ```
+
+If you already created the first two tables, just run the `channels` block on
+its own to add the new feature.
 
 For `SUPABASE_URL`: Settings → Data API → Project URL (looks like
 `https://<project-ref>.supabase.co`), or the green **Connect** button.
@@ -82,7 +92,11 @@ little credit so the summarization model can run.
 Create an app at https://api.slack.com/apps.
 
 **Bot Token Scopes** (OAuth & Permissions): `chat:write`, `im:history`,
-`im:write`, `users:read`.
+`im:write`, `users:read`, `channels:read`, `groups:read`, `mpim:history`,
+`mpim:read`.
+(`channels:read` / `groups:read` let the bot receive the "added to a channel"
+events for public / private channels; `mpim:history` / `mpim:read` let it see
+messages in group DMs it's part of.)
 
 Install the app to your workspace, then copy the **Bot User OAuth Token**
 (`xoxb-…` → `SLACK_BOT_TOKEN`) and, from **Basic Information**, the **Signing
@@ -94,7 +108,11 @@ DM the bot.
 
 **Event Subscriptions** (set the Request URL after you have a Vercel domain):
 - Request URL: `https://<your-vercel-domain>/api/slack/events`
-- Subscribe to bot event: `message.im`
+- Subscribe to bot events: `message.im`, `message.mpim`,
+  `member_joined_channel`, `member_left_channel`
+
+After adding scopes or events you must **reinstall the app** for them to take
+effect.
 
 ---
 
@@ -159,14 +177,26 @@ URL and the Slack Request URL.
 - DM the bot **`subscribe`** → added to `subscribers`, gets a confirmation.
 - DM **`unsubscribe`** → removed, gets a goodbye.
 - Any other DM → a short help message.
+- **Add the bot to a channel** (e.g. `/invite @ARIA`) → it registers that
+  channel and posts every future summary there too. Remove it from the channel
+  to stop. Private channels work if you invite the bot directly.
+- **Add the bot to a group DM** → once someone sends any message in the group,
+  the bot registers it and starts posting summaries there. Type `stop` in the
+  group to turn it off. (Group DMs have no "added" event, so a first message is
+  what activates it.)
 
-When a newsletter arrives, every subscriber receives:
+When a newsletter arrives, every subscriber, channel, and group DM receives:
 
 ```
 📄 *<Subject line>*
 
 <3–5 sentence executive summary>
+<https://activantcapital.com/…|Read the full piece →>
 ```
+
+The link line is appended in code (not by the model) whenever a full-article
+URL can be found in the email, so it stays correct regardless of which prompt
+you use.
 
 ---
 

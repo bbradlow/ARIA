@@ -3,15 +3,14 @@ import crypto from "crypto";
 const SLACK_API = "https://slack.com/api";
 
 /**
- * Send a Slack DM via chat.postMessage.
+ * Post a message via chat.postMessage. `channel` may be a user ID (Slack opens
+ * the DM automatically), a DM channel ID, or a public/private channel ID the
+ * bot is a member of.
  *
- * `channel` may be a user ID (e.g. "U0123") — Slack resolves it to that user's
- * DM channel automatically — or a DM channel ID (e.g. "D0123").
- *
- * Note: Slack's Web API returns HTTP 200 even for failures; the real status is
- * in the JSON body's `ok` field, so we inspect that and throw on failure.
+ * Slack's Web API returns HTTP 200 even on failure; the real status is the
+ * JSON body's `ok` field, so we inspect that and throw on failure.
  */
-export async function sendSlackDM(channel: string, text: string): Promise<void> {
+export async function postSlackMessage(channel: string, text: string): Promise<void> {
   const token = process.env.SLACK_BOT_TOKEN;
   if (!token) throw new Error("Missing SLACK_BOT_TOKEN environment variable");
 
@@ -26,20 +25,38 @@ export async function sendSlackDM(channel: string, text: string): Promise<void> 
 
   const data = (await res.json()) as { ok: boolean; error?: string };
   if (!data.ok) {
-    throw new Error(
-      `Slack chat.postMessage failed: ${data.error ?? "unknown_error"}`
-    );
+    throw new Error(`Slack chat.postMessage failed: ${data.error ?? "unknown_error"}`);
   }
 }
 
+// Cache the bot's own user id across warm invocations to avoid repeat lookups.
+let cachedBotUserId: string | null = null;
+
 /**
- * Verify an inbound Slack request using HMAC-SHA256.
- *
- * Slack signs each request as `v0=<hmac>` over the string
- * `v0:<timestamp>:<raw_body>` keyed by the app's signing secret. We also reject
- * requests with a timestamp older than 5 minutes to mitigate replay attacks.
- *
- * IMPORTANT: `rawBody` must be the exact, unparsed request body string.
+ * Resolve the bot's own Slack user ID (via auth.test). Used to tell whether a
+ * member_joined_channel / member_left_channel event refers to the bot itself.
+ */
+export async function getBotUserId(): Promise<string> {
+  if (cachedBotUserId) return cachedBotUserId;
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!token) throw new Error("Missing SLACK_BOT_TOKEN environment variable");
+
+  const res = await fetch(`${SLACK_API}/auth.test`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = (await res.json()) as { ok: boolean; user_id?: string; error?: string };
+  if (!data.ok || !data.user_id) {
+    throw new Error(`Slack auth.test failed: ${data.error ?? "unknown_error"}`);
+  }
+  cachedBotUserId = data.user_id;
+  return cachedBotUserId;
+}
+
+/**
+ * Verify an inbound Slack request using HMAC-SHA256 over `v0:<ts>:<rawBody>`,
+ * plus a 5-minute timestamp window for replay protection. `rawBody` must be the
+ * exact, unparsed request body string.
  */
 export function verifySlackSignature(
   rawBody: string,
@@ -49,20 +66,15 @@ export function verifySlackSignature(
   const signingSecret = process.env.SLACK_SIGNING_SECRET;
   if (!signingSecret || !timestamp || !signature) return false;
 
-  // Replay protection: reject anything older than five minutes.
   const FIVE_MINUTES = 60 * 5;
   const now = Math.floor(Date.now() / 1000);
   const ts = parseInt(timestamp, 10);
   if (Number.isNaN(ts) || Math.abs(now - ts) > FIVE_MINUTES) return false;
 
   const base = `v0:${timestamp}:${rawBody}`;
-  const hmac = crypto
-    .createHmac("sha256", signingSecret)
-    .update(base)
-    .digest("hex");
+  const hmac = crypto.createHmac("sha256", signingSecret).update(base).digest("hex");
   const expected = `v0=${hmac}`;
 
-  // Constant-time comparison to avoid timing leaks.
   const a = Buffer.from(expected, "utf8");
   const b = Buffer.from(signature, "utf8");
   if (a.length !== b.length) return false;

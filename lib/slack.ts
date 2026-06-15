@@ -10,7 +10,11 @@ const SLACK_API = "https://slack.com/api";
  * Slack's Web API returns HTTP 200 even on failure; the real status is the
  * JSON body's `ok` field, so we inspect that and throw on failure.
  */
-export async function postSlackMessage(channel: string, text: string): Promise<void> {
+export async function postSlackMessage(
+  channel: string,
+  text: string,
+  threadTs?: string
+): Promise<void> {
   const token = process.env.SLACK_BOT_TOKEN;
   if (!token) throw new Error("Missing SLACK_BOT_TOKEN environment variable");
 
@@ -20,7 +24,7 @@ export async function postSlackMessage(channel: string, text: string): Promise<v
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json; charset=utf-8",
     },
-    body: JSON.stringify({ channel, text }),
+    body: JSON.stringify({ channel, text, ...(threadTs ? { thread_ts: threadTs } : {}) }),
   });
 
   const data = (await res.json()) as { ok: boolean; error?: string };

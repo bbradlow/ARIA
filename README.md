@@ -80,6 +80,46 @@ alter table channels add column active boolean not null default true;
 
 If you haven't created any of these yet, run the whole block above.
 
+For the research Q&A feature, also enable `pgvector` and add a chunk table plus
+a similarity-search function:
+
+```sql
+create extension if not exists vector;
+
+-- One row per chunk of an article (article text is split before embedding).
+create table research_chunks (
+  id uuid primary key default gen_random_uuid(),
+  article_title text,
+  article_url text,
+  published_at date,
+  content text not null,
+  embedding vector(1024),        -- matches Voyage voyage-finance-2
+  created_at timestamptz default now()
+);
+
+create index on research_chunks using hnsw (embedding vector_cosine_ops);
+
+-- Top-k nearest chunks by cosine similarity.
+create or replace function match_research_chunks(
+  query_embedding vector(1024),
+  match_count int default 6
+)
+returns table (
+  content text,
+  article_title text,
+  article_url text,
+  similarity float
+)
+language sql stable
+as $$
+  select content, article_title, article_url,
+         1 - (embedding <=> query_embedding) as similarity
+  from research_chunks
+  order by embedding <=> query_embedding
+  limit match_count;
+$$;
+```
+
 For `SUPABASE_URL`: Settings → Data API → Project URL (looks like
 `https://<project-ref>.supabase.co`), or the green **Connect** button.
 For `SUPABASE_SERVICE_ROLE_KEY`: Settings → API Keys → copy the **secret** key
@@ -101,10 +141,10 @@ Create an app at https://api.slack.com/apps.
 
 **Bot Token Scopes** (OAuth & Permissions): `chat:write`, `im:history`,
 `im:write`, `users:read`, `channels:read`, `groups:read`, `mpim:history`,
-`mpim:read`.
+`mpim:read`, `app_mentions:read`.
 (`channels:read` / `groups:read` let the bot receive the "added to a channel"
-events for public / private channels; `mpim:history` / `mpim:read` let it see
-messages in group DMs it's part of.)
+events; `mpim:history` / `mpim:read` let it see group-DM messages;
+`app_mentions:read` lets it receive @mentions in channels for Q&A.)
 
 Install the app to your workspace, then copy the **Bot User OAuth Token**
 (`xoxb-…` → `SLACK_BOT_TOKEN`) and, from **Basic Information**, the **Signing
@@ -116,7 +156,7 @@ DM the bot.
 
 **Event Subscriptions** (set the Request URL after you have a Vercel domain):
 - Request URL: `https://<your-vercel-domain>/api/slack/events`
-- Subscribe to bot events: `message.im`, `message.mpim`,
+- Subscribe to bot events: `message.im`, `message.mpim`, `app_mention`,
   `member_joined_channel`, `member_left_channel`
 
 After adding scopes or events you must **reinstall the app** for them to take
@@ -157,10 +197,13 @@ OPENROUTER_API_KEY=
 SLACK_BOT_TOKEN=
 SLACK_SIGNING_SECRET=
 POSTMARK_WEBHOOK_TOKEN=
+VOYAGE_API_KEY=          # embeddings for research Q&A (Voyage finance-2)
+INGEST_TOKEN=            # guards the /api/ingest admin endpoint
 ```
 
 `POSTMARK_WEBHOOK_TOKEN` must be the exact same string you appended as `?token=`
-on the Postmark webhook URL.
+on the Postmark webhook URL. `INGEST_TOKEN` is a long random string you invent;
+you'll pass it as `?token=` when loading the back catalog (below).
 
 ---
 
@@ -178,13 +221,32 @@ vercel --prod        # deploy
 After the first deploy, plug your real Vercel domain into the Postmark webhook
 URL and the Slack Request URL.
 
+### Load the research back catalog
+
+Once deployed, populate the library by visiting the ingest endpoint in your
+browser:
+
+```
+https://<your-vercel-domain>/api/ingest?token=<INGEST_TOKEN>
+```
+
+It crawls `activantcapital.com/research`, fetches each article, chunks, embeds,
+and stores them. It works in batches to stay within the function time limit and
+skips articles already stored — so if the JSON response shows `"remaining"` above
+0, just refresh the URL until it reaches 0. New newsletters auto-ingest going
+forward, so this is only needed once for the existing articles.
+
 ---
 
 ## Using the bot
 
 - DM the bot **`subscribe`** → added to `subscribers`, gets a confirmation.
 - DM **`unsubscribe`** → removed, gets a goodbye.
-- Any other DM → a short help message.
+- Any other DM → ARIA treats it as a question and searches the research library
+  (type `help` to see the command list instead).
+- **@mention the bot in a channel** with a question → it answers from the
+  research library, in a thread, with source links. (Anything that isn't a
+  start/stop command is treated as a question.)
 - **Add the bot to a channel** (e.g. `/invite @ARIA`) → it registers that
   channel and posts every future summary there too. Remove it from the channel
   to stop. Private channels work if you invite the bot directly.

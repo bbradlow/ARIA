@@ -3,6 +3,7 @@ import * as cheerio from "cheerio";
 import crypto from "crypto";
 import { getSupabase } from "@/lib/supabase";
 import { postSlackMessage } from "@/lib/slack";
+import { fetchArticle, ingestArticle } from "@/lib/ingest";
 
 // cheerio + node crypto require the Node.js runtime (not Edge).
 export const runtime = "nodejs";
@@ -214,6 +215,24 @@ export async function POST(req: NextRequest) {
       } catch (err) {
         console.error(`Failed to post to channel ${ch.slack_channel_id}:`, err);
       }
+    }
+
+    // Auto-ingest into the research library (best-effort — never block or fail
+    // the summary fan-out). Prefer the full article when we have its URL.
+    try {
+      if (articleUrl) {
+        let toIngest;
+        try {
+          toIngest = await fetchArticle(articleUrl);
+        } catch {
+          toIngest = { title: subject, url: articleUrl, text: body };
+        }
+        await ingestArticle(toIngest);
+      } else {
+        await ingestArticle({ title: subject, text: body });
+      }
+    } catch (err) {
+      console.error("Auto-ingest of newsletter failed:", err);
     }
 
     return Response.json({

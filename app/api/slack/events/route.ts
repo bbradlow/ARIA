@@ -2,21 +2,27 @@ import { NextRequest } from "next/server";
 import { waitUntil } from "@vercel/functions";
 import { getSupabase } from "@/lib/supabase";
 import { postSlackMessage, getBotUserId, verifySlackSignature } from "@/lib/slack";
+import { answerQuestion } from "@/lib/qa";
 
 // node crypto (signature verification) requires the Node.js runtime.
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 const SUBSCRIBE_REPLY =
   "✅ You're subscribed! You'll receive a DM summary every time a new Activant Capital research newsletter arrives.";
 const UNSUBSCRIBE_REPLY =
   "👋 You've been unsubscribed and won't receive any more research alerts.";
 const HELP_REPLY =
-  "👋 Hi! I send summaries of new Activant Capital research emails directly to you.\n" +
-  "• Type `subscribe` to start receiving alerts.\n" +
-  "• Type `unsubscribe` to stop.";
+  "👋 Hi! I summarize new Activant research and can answer questions about past research.\n" +
+  "• Type `subscribe` to get DM summaries of new issues.\n" +
+  "• Type `unsubscribe` to stop.\n" +
+  "• Ask me anything else and I'll search the research library.";
 const CHANNEL_WELCOME =
-  "👋 I'll post a summary in this channel whenever a new Activant Capital research newsletter is published. Remove me from the channel to stop.";
+  "👋 I'll post a summary in this channel whenever a new Activant Capital research newsletter is published. Remove me from the channel to stop. @mention me with a question anytime.";
+
+const STOP_WORDS = ["stop", "pause", "unsubscribe", "leave"];
+const START_WORDS = ["start", "resume", "subscribe", "begin"];
 
 interface SlackEvent {
   type?: string;
@@ -26,6 +32,8 @@ interface SlackEvent {
   text?: string;
   channel?: string;
   channel_type?: string;
+  ts?: string;
+  thread_ts?: string;
 }
 
 interface SlackEnvelope {
@@ -34,16 +42,21 @@ interface SlackEnvelope {
   event?: SlackEvent;
 }
 
-// 1:1 DM to the bot: subscribe / unsubscribe / help.
+function stripMention(text: string, botId: string): string {
+  return (text || "").replace(new RegExp(`<@${botId}>`, "g"), "").trim();
+}
+
+// 1:1 DM: subscribe / unsubscribe / help commands, otherwise a question.
 async function handleDirectMessage(event: SlackEvent): Promise<void> {
   if (event.bot_id || event.subtype) return;
   if (!event.user || !event.channel) return;
 
-  const command = (event.text ?? "").trim().toLowerCase();
+  const text = event.text ?? "";
+  const cmd = text.trim().toLowerCase();
   const supabase = getSupabase();
 
   try {
-    if (command === "subscribe") {
+    if (cmd === "subscribe") {
       const { error } = await supabase
         .from("subscribers")
         .upsert(
@@ -52,54 +65,82 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
         );
       if (error) throw error;
       await postSlackMessage(event.channel, SUBSCRIBE_REPLY);
-    } else if (command === "unsubscribe") {
+    } else if (cmd === "unsubscribe") {
       const { error } = await supabase
         .from("subscribers")
         .delete()
         .eq("slack_user_id", event.user);
       if (error) throw error;
       await postSlackMessage(event.channel, UNSUBSCRIBE_REPLY);
-    } else {
+    } else if (cmd === "help" || cmd === "") {
       await postSlackMessage(event.channel, HELP_REPLY);
+    } else {
+      const answer = await answerQuestion(text);
+      await postSlackMessage(event.channel, answer);
     }
   } catch (err) {
     console.error("Failed to handle Slack DM:", err);
+    try {
+      await postSlackMessage(event.channel, "Sorry — I hit an error handling that.");
+    } catch {}
   }
 }
 
-// Multi-person DM (group chat). There's no "added to mpim" event, so we
-// register the group the first time we see a message in it. To avoid casual
-// chatter toggling the bot, the stop/start commands must @mention the bot;
-// pausing is durable (active=false) and only an explicit start resumes it.
+// Channel @mention (app_mention event) — always treated as a question.
+async function handleChannelMention(event: SlackEvent): Promise<void> {
+  if (event.bot_id || !event.channel) return;
+
+  let botId: string;
+  try {
+    botId = await getBotUserId();
+  } catch (err) {
+    console.error("Could not resolve bot user id:", err);
+    return;
+  }
+
+  const question = stripMention(event.text ?? "", botId);
+  const threadTs = event.thread_ts ?? event.ts;
+
+  try {
+    const answer = await answerQuestion(question);
+    await postSlackMessage(event.channel, answer, threadTs);
+  } catch (err) {
+    console.error("Failed to answer channel mention:", err);
+    try {
+      await postSlackMessage(event.channel, "Sorry — I hit an error answering that.", threadTs);
+    } catch {}
+  }
+}
+
+// Group DM (message.mpim). Commands must @mention the bot and be exactly the
+// command word. A mention with anything else is a question. A non-mention
+// message registers the group for summaries on first sight.
 async function handleGroupMessage(event: SlackEvent): Promise<void> {
   if (event.bot_id || event.subtype) return;
   if (!event.channel) return;
 
-  let botUserId: string;
+  let botId: string;
   try {
-    botUserId = await getBotUserId();
+    botId = await getBotUserId();
   } catch (err) {
     console.error("Could not resolve bot user id:", err);
     return;
   }
 
   const raw = event.text ?? "";
-  const lower = raw.toLowerCase();
-  const mentioned = raw.includes(`<@${botUserId}>`);
-  const wantsStop = /\b(stop|unsubscribe|leave|pause)\b/.test(lower);
-  const wantsStart = /\b(start|subscribe|resume|begin)\b/.test(lower);
+  const mentioned = raw.includes(`<@${botId}>`);
+  const stripped = stripMention(raw, botId);
+  const lc = stripped.toLowerCase();
 
   const channel = event.channel;
   const supabase = getSupabase();
   const welcome =
     `👋 I'll post a summary in this group whenever a new Activant Capital research ` +
-    `newsletter is published. To pause me, mention me with "stop" (e.g. <@${botUserId}> stop); ` +
-    `mention me with "start" to resume.`;
+    `newsletter is published. To pause me, mention me with "stop" (e.g. <@${botId}> stop); ` +
+    `mention me with "start" to resume. @mention me with a question anytime.`;
 
   try {
-    // Commands must @mention the bot — so someone typing "stop" mid-conversation
-    // never accidentally toggles anything.
-    if (mentioned && wantsStop) {
+    if (mentioned && STOP_WORDS.includes(lc)) {
       const { error } = await supabase
         .from("channels")
         .upsert(
@@ -113,7 +154,7 @@ async function handleGroupMessage(event: SlackEvent): Promise<void> {
       );
       return;
     }
-    if (mentioned && wantsStart) {
+    if (mentioned && START_WORDS.includes(lc)) {
       const { error } = await supabase
         .from("channels")
         .upsert(
@@ -124,10 +165,16 @@ async function handleGroupMessage(event: SlackEvent): Promise<void> {
       await postSlackMessage(channel, welcome);
       return;
     }
+    if (mentioned) {
+      // A question directed at the bot (doesn't change summary subscription).
+      const answer = await answerQuestion(stripped);
+      await postSlackMessage(channel, answer);
+      return;
+    }
 
-    // Not a command: auto-register on first sight only. If a row already exists
-    // (active or paused), leave its state untouched — chatter never reactivates
-    // a paused group.
+    // Not a command and not a mention: register on first sight; welcome only
+    // when newly inserted (so we don't greet on every message). A paused group
+    // stays paused — chatter never reactivates it.
     const { error } = await supabase
       .from("channels")
       .insert({ slack_channel_id: channel, active: true });
@@ -141,8 +188,7 @@ async function handleGroupMessage(event: SlackEvent): Promise<void> {
   }
 }
 
-// Bot added to / removed from a channel. member_joined_channel fires for every
-// member, so act only when the member is the bot itself.
+// Bot added to / removed from a channel.
 async function handleChannelMembership(
   event: SlackEvent,
   joined: boolean
@@ -183,6 +229,9 @@ async function handleChannelMembership(
 
 async function handleEvent(event: SlackEvent): Promise<void> {
   switch (event.type) {
+    case "app_mention":
+      await handleChannelMention(event);
+      break;
     case "message":
       if (event.channel_type === "mpim") {
         await handleGroupMessage(event);

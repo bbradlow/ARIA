@@ -1,7 +1,9 @@
 import { ThreadMessage } from "@/lib/slack";
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-const MODEL = "claude-sonnet-4-6";
+// Orchestration model. Default Sonnet; set AFFINITY_MODEL=claude-haiku-4-5 for
+// faster (lower-latency) multi-step tool loops, at some cost to reasoning.
+const MODEL = process.env.AFFINITY_MODEL || "claude-sonnet-4-6";
 const AFFINITY_MCP_URL = "https://mcp.affinity.co/mcp";
 const SERVER_NAME = "affinity";
 // Current MCP connector beta (the 2025-04-04 header is deprecated).

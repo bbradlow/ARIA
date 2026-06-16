@@ -6,6 +6,10 @@ const AFFINITY_MCP_URL = "https://mcp.affinity.co/mcp";
 const SERVER_NAME = "affinity";
 // Current MCP connector beta (the 2025-04-04 header is deprecated).
 const MCP_BETA = "mcp-client-2025-11-20";
+// Abort the Anthropic call before the function's maxDuration. Keep this a few
+// seconds under the events route maxDuration. Default 55s suits the Hobby 60s
+// cap; raise via AFFINITY_TIMEOUT_MS if you move to a plan with a higher limit.
+const TIMEOUT_MS = Number(process.env.AFFINITY_TIMEOUT_MS) || 55000;
 
 // Write-enabled by default. Set AFFINITY_READ_ONLY=true to restrict ARIA to
 // read/list/search tools (and have it decline edits).
@@ -29,7 +33,10 @@ const BASE_PROMPT =
   "a specific company, person, or deal, search or look it up directly by name — do NOT " +
   "list or page through entire lists or the full pipeline, which is slow and may time out. " +
   "Make the fewest, most targeted tool calls needed; if a couple of targeted searches " +
-  "don't find it, say so rather than enumerating large datasets. Be concise and write " +
+  "don't find it, say so rather than enumerating large datasets. When creating or " +
+  "updating a record, resolve the target with a single targeted search, then make the " +
+  "change in as few calls as possible and do not re-read or re-confirm it afterward " +
+  "unless asked. Be concise and write " +
   "for a Slack message: use single asterisks for *bold*, never double asterisks, and no " +
   "markdown headers. When you reference a record, include the most useful identifying " +
   "details (name, stage, owner, last activity). If Affinity returns nothing relevant, " +
@@ -107,7 +114,7 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 50000);
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
       const res = await fetch(ANTHROPIC_URL, {
         method: "POST",
@@ -145,7 +152,7 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         throw new Error(
-          "Affinity request timed out (~50s) — the query needed too many or too-large tool calls (often from scanning a whole list). Try a more specific question."
+          "Affinity request timed out — the query needed too many or too-large tool calls. Try a more specific question."
         );
       }
       if (attempt < maxAttempts) {

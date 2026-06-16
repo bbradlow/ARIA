@@ -7,7 +7,21 @@ const SERVER_NAME = "affinity";
 // Current MCP connector beta (the 2025-04-04 header is deprecated).
 const MCP_BETA = "mcp-client-2025-11-20";
 
-const SYSTEM_PROMPT =
+// Write-enabled by default. Set AFFINITY_READ_ONLY=true to restrict ARIA to
+// read/list/search tools (and have it decline edits).
+const READ_ONLY = process.env.AFFINITY_READ_ONLY === "true";
+
+// After running `$aff what tools do you have?`, paste the read/list/search/get
+// tool names here. When READ_ONLY is on AND this list is non-empty, ONLY these
+// tools are exposed to Claude — a hard block on writes at the connector layer.
+// Leave empty to rely on the read-only system instruction + Affinity scope.
+const READ_TOOLS: string[] = [
+  // "affinity_search",
+  // "affinity_get_company",
+  // "affinity_list_opportunities",
+];
+
+const BASE_PROMPT =
   "You are ARIA, a CRM intelligence assistant for Activant Capital. You have live " +
   "access to Activant's deal pipeline, contacts, organizations, and relationship data " +
   "through the Affinity MCP tools. Answer questions about the pipeline, companies, " +
@@ -16,6 +30,20 @@ const SYSTEM_PROMPT =
   "markdown headers. When you reference a record, include the most useful identifying " +
   "details (name, stage, owner, last activity). If Affinity returns nothing relevant, " +
   "say so plainly.";
+
+const READ_ONLY_CLAUSE =
+  " IMPORTANT: You are in READ-ONLY mode. Only use tools that retrieve, list, search, " +
+  "or read data. Never call any tool that creates, updates, deletes, or otherwise " +
+  "modifies Affinity data. If asked to change something, explain that you are currently " +
+  "read-only and cannot make edits.";
+
+function systemPrompt(): string {
+  return READ_ONLY ? BASE_PROMPT + READ_ONLY_CLAUSE : BASE_PROMPT;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // Anthropic requires messages to start with a user turn and alternate roles, so
 // drop leading assistant turns and merge consecutive same-role turns.
@@ -53,41 +81,79 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
   if (process.env.AFFINITY_MCP_TOKEN) {
     server.authorization_token = process.env.AFFINITY_MCP_TOKEN;
   }
-
-  const res = await fetch(ANTHROPIC_URL, {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": MCP_BETA,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 2000,
-      system: SYSTEM_PROMPT,
-      messages,
-      mcp_servers: [server],
-      tools: [{ type: "mcp_toolset", mcp_server_name: SERVER_NAME }],
-    }),
-  });
-
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Anthropic request failed (${res.status}): ${t}`);
+  // When read-only and an explicit read-tool allowlist is configured, restrict
+  // the connector to those tools so write tools are never callable.
+  if (READ_ONLY && READ_TOOLS.length > 0) {
+    server.tool_configuration = { enabled: true, allowed_tools: READ_TOOLS };
   }
 
-  const data = (await res.json()) as {
-    content?: { type: string; text?: string }[];
-  };
+  const requestBody = JSON.stringify({
+    model: MODEL,
+    max_tokens: 2000,
+    system: systemPrompt(),
+    messages,
+    mcp_servers: [server],
+    tools: [{ type: "mcp_toolset", mcp_server_name: SERVER_NAME }],
+  });
 
-  // The final answer is the concatenation of text blocks; mcp_tool_use /
-  // mcp_tool_result blocks are intermediate and can be ignored here.
-  const text = (data.content ?? [])
-    .filter((b) => b.type === "text" && b.text)
-    .map((b) => b.text as string)
-    .join("\n")
-    .trim();
+  // Retry transient Anthropic 5xx / network errors (they return fast, so this
+  // stays within the function budget). Timeouts are NOT retried.
+  const maxAttempts = 3;
+  let lastError = "";
 
-  return text || "I didn't get a usable answer back from Affinity.";
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 50000);
+    try {
+      const res = await fetch(ANTHROPIC_URL, {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": MCP_BETA,
+          "content-type": "application/json",
+        },
+        body: requestBody,
+        signal: controller.signal,
+      });
+
+      if (res.ok) {
+        const data = (await res.json()) as {
+          content?: { type: string; text?: string }[];
+        };
+        const text = (data.content ?? [])
+          .filter((b) => b.type === "text" && b.text)
+          .map((b) => b.text as string)
+          .join("\n")
+          .trim();
+        return text || "I didn't get a usable answer back from Affinity.";
+      }
+
+      const t = await res.text().catch(() => "");
+      lastError = `Anthropic request failed (${res.status}): ${t}`;
+      // A 500 here usually means the MCP connector couldn't reach/authenticate
+      // the Affinity server. Retry in case it's transient.
+      if (res.status >= 500 && attempt < maxAttempts) {
+        await sleep(1500 * attempt);
+        continue;
+      }
+      throw new Error(lastError);
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new Error(
+          "Affinity request timed out (~50s). This usually means a multi-step write that ran too long."
+        );
+      }
+      if (attempt < maxAttempts) {
+        lastError = err instanceof Error ? err.message : String(err);
+        await sleep(1500 * attempt);
+        continue;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw new Error(lastError || "Anthropic request failed after retries");
 }

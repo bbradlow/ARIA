@@ -47,7 +47,7 @@ function stripMention(text: string, botId: string): string {
   return (text || "").replace(new RegExp(`<@${botId}>`, "g"), "").trim();
 }
 
-// If the (mention-stripped) text starts with /aff, route to the Affinity CRM
+// If the (mention-stripped) text starts with $aff, route to the Affinity CRM
 // handler: pull the full thread for multi-turn context, answer via Claude + the
 // Affinity MCP server, and reply in-thread. Returns true if it handled the message.
 async function tryAffinity(
@@ -56,12 +56,12 @@ async function tryAffinity(
   threadTs: string,
   botId: string
 ): Promise<boolean> {
-  if (!/^\/aff\b/i.test(text.trim())) return false;
+  if (!/^\$aff\b/i.test(text.trim())) return false;
 
   try {
     const history = await getThreadMessages(channel, threadTs, botId);
     const fallback = [
-      { role: "user" as const, content: text.trim().replace(/^\/aff\b/i, "").trim() },
+      { role: "user" as const, content: text.trim().replace(/^\$aff\b/i, "").trim() },
     ];
     const answer = await askAffinity(history.length > 0 ? history : fallback);
     await postSlackMessage(channel, answer, threadTs);

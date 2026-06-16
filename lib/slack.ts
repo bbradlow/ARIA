@@ -65,7 +65,7 @@ export interface ThreadMessage {
 /**
  * Fetch a thread's messages (via conversations.replies) as role-tagged turns
  * for multi-turn LLM context. Bot messages become "assistant", everyone else
- * "user". The bot mention and a leading "/aff" are stripped from user turns.
+ * "user". The bot mention and a leading "$aff" are stripped from user turns.
  * Requires the matching history scope for the conversation type
  * (channels:history / groups:history / im:history / mpim:history).
  */
@@ -96,7 +96,7 @@ export async function getThreadMessages(
     if (m.subtype && m.subtype !== "bot_message") continue; // skip joins/system
     const isBot = !!m.bot_id || m.user === botUserId;
     let content = (m.text ?? "").replace(mentionRe, "").trim();
-    if (!isBot) content = content.replace(/^\/aff\b/i, "").trim();
+    if (!isBot) content = content.replace(/^\$aff\b/i, "").trim();
     if (!content) continue;
     out.push({ role: isBot ? "assistant" : "user", content });
   }

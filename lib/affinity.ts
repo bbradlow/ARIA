@@ -42,7 +42,7 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
 
   const messages = normalize(history);
   if (messages.length === 0) {
-    return "Ask me about the pipeline — e.g. `@ARIA /aff which deals are in diligence?`";
+    return "Ask me about the pipeline — e.g. `@ARIA $aff which deals are in diligence?`";
   }
 
   const server: Record<string, unknown> = {

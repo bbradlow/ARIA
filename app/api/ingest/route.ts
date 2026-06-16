@@ -1,14 +1,19 @@
 import { NextRequest } from "next/server";
 import crypto from "crypto";
-import { listArticleUrls, fetchArticle, ingestArticle, isArticleIngested } from "@/lib/ingest";
+import { getSupabase } from "@/lib/supabase";
+import { listArticleUrls, fetchArticle, ingestArticle } from "@/lib/ingest";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-// Articles to process per invocation, so the function stays within its time
-// limit. Re-run the endpoint until "remaining" is 0.
-const BATCH = 6;
+// Stop ingesting before Vercel's 60s function limit, then return so you can
+// call again to continue.
+const TIME_BUDGET_MS = 45000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function timingSafeEqualStr(a: string, b: string): boolean {
   const ab = Buffer.from(a);
@@ -24,52 +29,76 @@ function verify(req: NextRequest): boolean {
   return !!provided && timingSafeEqualStr(provided, expected);
 }
 
-// GET /api/ingest?token=...  → crawl the research index and ingest the next
-// batch of not-yet-stored articles. Call repeatedly until remaining hits 0.
+const NO_CACHE = { "Cache-Control": "no-store" };
+
 export async function GET(req: NextRequest) {
-  if (!verify(req)) return new Response("Forbidden", { status: 403 });
+  if (!verify(req)) return new Response("Forbidden", { status: 403, headers: NO_CACHE });
 
+  const started = Date.now();
   try {
+    const supabase = getSupabase();
     const allUrls = await listArticleUrls();
+
+    // Robust dedup: fetch the URLs already stored (limited to this article set)
+    // in ONE query and compare in memory.
+    const stored = new Set<string>();
+    {
+      const { data, error } = await supabase
+        .from("research_chunks")
+        .select("article_url")
+        .in("article_url", allUrls);
+      if (error) throw error;
+      for (const row of data ?? []) {
+        if (row.article_url) stored.add(row.article_url as string);
+      }
+    }
+
+    const pending = allUrls.filter((u) => !stored.has(u));
     const ingested: { url: string; chunks: number }[] = [];
-    let remaining = 0;
+    const failed: { url: string; error: string }[] = [];
 
-    for (const url of allUrls) {
-      let done: boolean;
-      try {
-        done = await isArticleIngested(url);
-      } catch (err) {
-        console.error(`Existence check failed for ${url}:`, err);
-        continue;
-      }
-      if (done) continue;
-
-      if (ingested.length >= BATCH) {
-        remaining += 1;
-        continue;
-      }
-
+    for (const url of pending) {
+      if (Date.now() - started > TIME_BUDGET_MS) break;
       try {
         const article = await fetchArticle(url);
         const chunks = await ingestArticle(article);
         ingested.push({ url, chunks });
       } catch (err) {
-        console.error(`Ingest failed for ${url}:`, err);
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`Ingest failed for ${url}:`, message);
+        failed.push({ url, error: message });
       }
+      await sleep(200);
     }
 
-    return Response.json({
-      total_articles: allUrls.length,
-      ingested_this_run: ingested.length,
-      remaining,
-      details: ingested,
-      note:
-        remaining > 0
-          ? "More articles remain — call this URL again to continue."
-          : "All articles are ingested.",
-    });
+    const remaining = pending.length - ingested.length;
+    let note: string;
+    if (pending.length === 0) {
+      note = "All articles are already ingested.";
+    } else if (failed.length > 0) {
+      note = `${failed.length} article(s) failed this run — see failed[]. If they are rate-limit errors, wait a moment and call again.`;
+    } else if (remaining > 0) {
+      note = "Time budget reached — call this URL again to continue.";
+    } else {
+      note = "All articles are now ingested.";
+    }
+
+    return Response.json(
+      {
+        total_articles: allUrls.length,
+        already_stored: stored.size,
+        pending_before_run: pending.length,
+        ingested_this_run: ingested.length,
+        failed_this_run: failed.length,
+        remaining,
+        ingested,
+        failed,
+        note,
+      },
+      { headers: NO_CACHE }
+    );
   } catch (err) {
     console.error("Ingest crawl failed:", err);
-    return new Response("Ingest error", { status: 500 });
+    return new Response("Ingest error", { status: 500, headers: NO_CACHE });
   }
 }

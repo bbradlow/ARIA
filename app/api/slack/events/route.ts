@@ -1,8 +1,9 @@
 import { NextRequest } from "next/server";
 import { waitUntil } from "@vercel/functions";
 import { getSupabase } from "@/lib/supabase";
-import { postSlackMessage, getBotUserId, verifySlackSignature } from "@/lib/slack";
+import { postSlackMessage, getBotUserId, getThreadMessages, verifySlackSignature } from "@/lib/slack";
 import { answerQuestion } from "@/lib/qa";
+import { askAffinity } from "@/lib/affinity";
 
 // node crypto (signature verification) requires the Node.js runtime.
 export const runtime = "nodejs";
@@ -46,6 +47,33 @@ function stripMention(text: string, botId: string): string {
   return (text || "").replace(new RegExp(`<@${botId}>`, "g"), "").trim();
 }
 
+// If the (mention-stripped) text starts with $aff, route to the Affinity CRM
+// handler: pull the full thread for multi-turn context, answer via Claude + the
+// Affinity MCP server, and reply in-thread. Returns true if it handled the message.
+async function tryAffinity(
+  channel: string,
+  text: string,
+  threadTs: string,
+  botId: string
+): Promise<boolean> {
+  if (!/^\$aff\b/i.test(text.trim())) return false;
+
+  try {
+    const history = await getThreadMessages(channel, threadTs, botId);
+    const fallback = [
+      { role: "user" as const, content: text.trim().replace(/^\$aff\b/i, "").trim() },
+    ];
+    const answer = await askAffinity(history.length > 0 ? history : fallback);
+    await postSlackMessage(channel, answer, threadTs);
+  } catch (err) {
+    console.error("Affinity handler failed:", err);
+    try {
+      await postSlackMessage(channel, "Sorry — I hit an error querying Affinity.", threadTs);
+    } catch {}
+  }
+  return true;
+}
+
 // 1:1 DM: subscribe / unsubscribe / help commands, otherwise a question.
 async function handleDirectMessage(event: SlackEvent): Promise<void> {
   if (event.bot_id || event.subtype) return;
@@ -75,6 +103,12 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
     } else if (cmd === "help" || cmd === "") {
       await postSlackMessage(event.channel, HELP_REPLY);
     } else {
+      let botId = "";
+      try {
+        botId = await getBotUserId();
+      } catch {}
+      const threadTs = event.thread_ts ?? event.ts;
+      if (botId && threadTs && (await tryAffinity(event.channel, text, threadTs, botId))) return;
       const answer = await answerQuestion(text);
       await postSlackMessage(event.channel, answer);
     }
@@ -102,6 +136,7 @@ async function handleChannelMention(event: SlackEvent): Promise<void> {
   const threadTs = event.thread_ts ?? event.ts;
 
   try {
+    if (threadTs && (await tryAffinity(event.channel, question, threadTs, botId))) return;
     const answer = await answerQuestion(question);
     await postSlackMessage(event.channel, answer, threadTs);
   } catch (err) {
@@ -167,6 +202,8 @@ async function handleGroupMessage(event: SlackEvent): Promise<void> {
     }
     if (mentioned) {
       // A question directed at the bot (doesn't change summary subscription).
+      const threadTs = event.thread_ts ?? event.ts;
+      if (threadTs && (await tryAffinity(channel, stripped, threadTs, botId))) return;
       const answer = await answerQuestion(stripped);
       await postSlackMessage(channel, answer);
       return;

@@ -141,10 +141,12 @@ Create an app at https://api.slack.com/apps.
 
 **Bot Token Scopes** (OAuth & Permissions): `chat:write`, `im:history`,
 `im:write`, `users:read`, `channels:read`, `groups:read`, `mpim:history`,
-`mpim:read`, `app_mentions:read`.
+`mpim:read`, `app_mentions:read`, `channels:history`, `groups:history`.
 (`channels:read` / `groups:read` let the bot receive the "added to a channel"
 events; `mpim:history` / `mpim:read` let it see group-DM messages;
-`app_mentions:read` lets it receive @mentions in channels for Q&A.)
+`app_mentions:read` lets it receive @mentions in channels for Q&A;
+`channels:history` / `groups:history` let it read thread history for the `$aff`
+multi-turn CRM mode.)
 
 Install the app to your workspace, then copy the **Bot User OAuth Token**
 (`xoxb-…` → `SLACK_BOT_TOKEN`) and, from **Basic Information**, the **Signing
@@ -199,6 +201,8 @@ SLACK_SIGNING_SECRET=
 POSTMARK_WEBHOOK_TOKEN=
 VOYAGE_API_KEY=          # embeddings for research Q&A (Voyage finance-2)
 INGEST_TOKEN=            # guards the /api/ingest admin endpoint
+ANTHROPIC_API_KEY=       # $aff CRM mode (Anthropic Messages API + MCP connector)
+AFFINITY_MCP_TOKEN=      # OAuth bearer token for the Affinity MCP server
 ```
 
 `POSTMARK_WEBHOOK_TOKEN` must be the exact same string you appended as `?token=`
@@ -236,6 +240,11 @@ skips articles already stored — so if the JSON response shows `"remaining"` ab
 0, just refresh the URL until it reaches 0. New newsletters auto-ingest going
 forward, so this is only needed once for the existing articles.
 
+Note: Voyage's free trial caps embeddings at 3 requests/minute, which will make
+most articles fail with a rate-limit error (shown in the `failed[]` array). Add
+a payment method on the Voyage dashboard to lift the cap — the free token
+allowance still applies, so you won't be charged at this volume.
+
 ---
 
 ## Using the bot
@@ -247,6 +256,12 @@ forward, so this is only needed once for the existing articles.
 - **@mention the bot in a channel** with a question → it answers from the
   research library, in a thread, with source links. (Anything that isn't a
   start/stop command is treated as a question.)
+- **`@ARIA $aff <query>`** → CRM mode: instead of the research library, ARIA
+  queries Activant's Affinity pipeline/contacts/orgs/deals (via the Affinity MCP
+  server) and replies in-thread. Follow-ups in the same thread keep context, so
+  you can ask "and which of those closed?" without repeating yourself. In a
+  direct message you can drop the mention and just send `$aff <query>` — the `$`
+  prefix is used (not `/`) so Slack doesn't intercept it as a slash command.
 - **Add the bot to a channel** (e.g. `/invite @ARIA`) → it registers that
   channel and posts every future summary there too. Remove it from the channel
   to stop. Private channels work if you invite the bot directly.

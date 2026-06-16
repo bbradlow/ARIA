@@ -57,6 +57,52 @@ export async function getBotUserId(): Promise<string> {
   return cachedBotUserId;
 }
 
+export interface ThreadMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/**
+ * Fetch a thread's messages (via conversations.replies) as role-tagged turns
+ * for multi-turn LLM context. Bot messages become "assistant", everyone else
+ * "user". The bot mention and a leading "$aff" are stripped from user turns.
+ * Requires the matching history scope for the conversation type
+ * (channels:history / groups:history / im:history / mpim:history).
+ */
+export async function getThreadMessages(
+  channel: string,
+  threadTs: string,
+  botUserId: string
+): Promise<ThreadMessage[]> {
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!token) throw new Error("Missing SLACK_BOT_TOKEN environment variable");
+
+  const params = new URLSearchParams({ channel, ts: threadTs, limit: "50" });
+  const res = await fetch(`${SLACK_API}/conversations.replies?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = (await res.json()) as {
+    ok: boolean;
+    error?: string;
+    messages?: { user?: string; bot_id?: string; text?: string; subtype?: string }[];
+  };
+  if (!data.ok) {
+    throw new Error(`Slack conversations.replies failed: ${data.error ?? "unknown_error"}`);
+  }
+
+  const mentionRe = new RegExp(`<@${botUserId}>`, "g");
+  const out: ThreadMessage[] = [];
+  for (const m of data.messages ?? []) {
+    if (m.subtype && m.subtype !== "bot_message") continue; // skip joins/system
+    const isBot = !!m.bot_id || m.user === botUserId;
+    let content = (m.text ?? "").replace(mentionRe, "").trim();
+    if (!isBot) content = content.replace(/^\$aff\b/i, "").trim();
+    if (!content) continue;
+    out.push({ role: isBot ? "assistant" : "user", content });
+  }
+  return out;
+}
+
 /**
  * Verify an inbound Slack request using HMAC-SHA256 over `v0:<ts>:<rawBody>`,
  * plus a 5-minute timestamp window for replay protection. `rawBody` must be the

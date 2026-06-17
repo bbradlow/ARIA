@@ -105,7 +105,7 @@ async function summarize(title: string, body: string): Promise<string> {
   // The instructions and model are configurable via env vars so you can tune
   // them in the Vercel dashboard without editing code.
   const defaultPrompt =
-    "You are a research analyst assistant. Given the full text of a research newsletter email, produce a concise 3-5 sentence executive summary suitable for a Slack message to a team of investors. Highlight the core thesis, key data points, and takeaway. Do not include any preamble or sign-off — just the summary.";
+    "You are a research analyst assistant. Given the full text of a research newsletter email, produce a concise executive summary for a Slack message to a team of investors. Structure the output as: (1) one or two sentences stating the core thesis; (2) a line reading *Key data points:* followed by each notable statistic or fact on its own separate line, each starting with the '•' character; (3) one short sentence with the takeaway. CRITICAL: every key data point bullet must be self-contained and independent. Never combine multiple statistics into a single sentence, and never join independent figures with connectives like 'yet', 'because', 'despite', or 'while' that imply a relationship between facts that are actually unrelated. One fact per bullet. Use Slack formatting: single asterisks for *bold*, no markdown headers. Do not include any preamble or sign-off — just the summary.";
   const systemPrompt = process.env.SUMMARY_SYSTEM_PROMPT?.trim() || defaultPrompt;
   const model = process.env.SUMMARY_MODEL?.trim() || "anthropic/claude-sonnet-4-5";
 

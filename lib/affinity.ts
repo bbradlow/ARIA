@@ -242,6 +242,8 @@ async function searchPersons(term: string): Promise<any[]> {
     id: p.id,
     name: [p.first_name, p.last_name].filter(Boolean).join(" "),
     email: p.primary_email ?? p.emails?.[0] ?? null,
+    // v1 person type: 0 = external, 1 = internal (team member), 2 = collaborator.
+    internal: p.type === 1 || /internal/i.test(String(p.type ?? "")),
   }));
 }
 
@@ -299,7 +301,11 @@ async function resolvePersonId(value: string): Promise<number> {
     const parts = v.split(/\s+/);
     if (parts.length > 1) candidates = await searchPersons(parts[parts.length - 1]);
   }
-  const picked = await pickBestMatch(v, candidates);
+  // Owner/team person fields only accept internal members, so prefer those;
+  // fall back to all candidates (for fields that reference external people).
+  const internal = candidates.filter((c: any) => c.internal);
+  let picked = internal.length ? await pickBestMatch(v, internal) : null;
+  if (picked == null) picked = await pickBestMatch(v, candidates);
   if (picked == null) throw new Error(`Person "${value}" not found in Affinity.`);
   return picked;
 }

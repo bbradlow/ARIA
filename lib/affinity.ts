@@ -179,7 +179,8 @@ async function updateField(term: string, fieldName: string, value: string): Prom
   if (!valueType) {
     throw new Error(`Couldn't determine the value type of "${field.name}" — not writing to avoid corrupting it.`);
   }
-  const valueObject = await buildValue(valueType, value);
+  const options = /dropdown/.test(valueType) ? await getDropdownOptions(field.id) : undefined;
+  const valueObject = await buildValue(valueType, value, options);
   await v2Request(
     `/v2/lists/${PIPELINE_LIST_ID}/list-entries/${entry.id}/fields/${field.id}`,
     {
@@ -318,9 +319,45 @@ async function resolveCompanyId(value: string): Promise<number> {
   return picked;
 }
 
+// Fetch a list field's dropdown options ({ id, text, rank }) so we can match a
+// user's value to a real option (and supply rank for ranked dropdowns).
+async function getDropdownOptions(fieldId: string): Promise<any[]> {
+  try {
+    const data = await v2Request(`/v2/lists/${PIPELINE_LIST_ID}/fields/${fieldId}/dropdown-options`);
+    const rows = data.data ?? data ?? [];
+    return rows.map((o: any) => ({ id: o.id, text: o.text, rank: o.rank }));
+  } catch {
+    return [];
+  }
+}
+
+// Match a value to a dropdown option (exact → loose → Sonnet). Returns the option.
+async function matchOption(value: string, options: any[]): Promise<any | null> {
+  if (!options.length) return null;
+  const exact = options.find((o) => normalizeName(o.text) === normalizeName(value));
+  if (exact) return exact;
+  const loose = options.filter((o) => looseMatch(o.text, value));
+  if (loose.length === 1) return loose[0];
+  try {
+    const list = options.map((o) => `- ${o.text} [id:${o.id}]`).join("\n");
+    const out = await openRouterChat([
+      { role: "system", content: "Pick the single option that best matches the user's value. Reply with ONLY the id number in [id:...], or none." },
+      { role: "user", content: `Value: "${value}"\n\nOptions:\n${list}` },
+    ]);
+    const m = out.match(/\d+/);
+    if (m) {
+      const found = options.find((o) => o.id === Number(m[0]));
+      if (found) return found;
+    }
+  } catch {
+    // fall through
+  }
+  return loose[0] ?? null;
+}
+
 // Build the typed value object { type, data } for a write, resolving IDs for
-// person/company fields. Covers every writable Affinity value type.
-async function buildValue(valueType: string, value: string): Promise<any> {
+// person/company fields and real options for dropdowns. Covers every type.
+async function buildValue(valueType: string, value: string, options?: any[]): Promise<any> {
   const t = valueType.toLowerCase();
   const clean = value.trim().replace(/^["']|["']$/g, "");
   switch (t) {
@@ -328,9 +365,24 @@ async function buildValue(valueType: string, value: string): Promise<any> {
     case "number": return { type: t, data: Number(clean) };
     case "number-multi": return { type: t, data: splitMulti(value).map(Number) };
     case "datetime": return { type: t, data: clean }; // YYYY-MM-DD; API ignores time
-    case "dropdown": return { type: t, data: { text: clean } };
-    case "dropdown-multi": return { type: t, data: splitMulti(value).map((text) => ({ text })) };
-    case "ranked-dropdown": return { type: t, data: { text: clean } };
+    case "dropdown": {
+      const opt = options ? await matchOption(clean, options) : null;
+      return { type: t, data: { text: opt ? opt.text : clean } };
+    }
+    case "dropdown-multi": {
+      const data = [];
+      for (const part of splitMulti(value)) {
+        const opt = options ? await matchOption(part, options) : null;
+        data.push({ text: opt ? opt.text : part });
+      }
+      return { type: t, data };
+    }
+    case "ranked-dropdown": {
+      const opt = options ? await matchOption(clean, options) : null;
+      // Ranked dropdowns require the rank, not just the text.
+      if (opt) return { type: t, data: { text: opt.text, rank: opt.rank } };
+      return { type: t, data: { text: clean } };
+    }
     case "person": return { type: t, data: { id: await resolvePersonId(clean) } };
     case "person-multi": {
       const out = [];

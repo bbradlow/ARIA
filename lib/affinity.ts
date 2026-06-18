@@ -238,15 +238,53 @@ async function whoami(): Promise<any> {
 
 async function searchPersons(term: string): Promise<any[]> {
   const data = await v1Get(`/persons?term=${encodeURIComponent(term)}`);
-  return (data.persons ?? []).slice(0, 5).map((p: any) => ({
+  return (data.persons ?? []).slice(0, 10).map((p: any) => ({
     id: p.id,
     name: [p.first_name, p.last_name].filter(Boolean).join(" "),
     email: p.primary_email ?? p.emails?.[0] ?? null,
   }));
 }
 
+function stripQuotes(value: string): string {
+  return value.trim().replace(/^["']|["']$/g, "");
+}
+
+// Use Sonnet (via OpenRouter) to choose the best candidate for a fuzzy
+// reference. Fast-paths a unique loose match; on any failure falls back to the
+// best heuristic match — it never throws, so fuzziness can't hard-error.
+async function pickBestMatch(
+  query: string,
+  candidates: { id: number; name: string; email?: string | null }[]
+): Promise<number | null> {
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0].id;
+  const loose = candidates.filter((c) => looseMatch(c.name, query));
+  if (loose.length === 1) return loose[0].id;
+  try {
+    const list = candidates
+      .map((c) => `- ${c.name}${c.email ? ` <${c.email}>` : ""} [id:${c.id}]`)
+      .join("\n");
+    const out = await openRouterChat([
+      {
+        role: "system",
+        content:
+          "Pick the single best candidate matching the user's reference. Reply with ONLY the id number shown in [id:...] for the best match, or the word none. No other text.",
+      },
+      { role: "user", content: `Reference: "${query}"\n\nCandidates:\n${list}` },
+    ]);
+    const m = out.match(/\d+/);
+    if (m) {
+      const id = Number(m[0]);
+      if (candidates.some((c) => c.id === id)) return id;
+    }
+  } catch {
+    // fall through to heuristic
+  }
+  return (loose[0] ?? candidates[0]).id;
+}
+
 async function resolvePersonId(value: string): Promise<number> {
-  const v = value.trim().replace(/^["']|["']$/g, "");
+  const v = stripQuotes(value);
   if (/^(me|myself|i|current user)$/i.test(v)) {
     const who = await whoami();
     const email = who?.user?.emailAddress;
@@ -255,18 +293,23 @@ async function resolvePersonId(value: string): Promise<number> {
       if (byEmail[0]) return byEmail[0].id;
     }
   }
-  const matches = await searchPersons(v);
-  if (!matches[0]) throw new Error(`Person "${value}" not found in Affinity.`);
-  const best = matches.find((m: any) => looseMatch(m.name, v)) ?? matches[0];
-  return best.id;
+  let candidates = await searchPersons(v);
+  if (!candidates.length) {
+    // Broaden: try the last token (surname) if the full term found nothing.
+    const parts = v.split(/\s+/);
+    if (parts.length > 1) candidates = await searchPersons(parts[parts.length - 1]);
+  }
+  const picked = await pickBestMatch(v, candidates);
+  if (picked == null) throw new Error(`Person "${value}" not found in Affinity.`);
+  return picked;
 }
 
 async function resolveCompanyId(value: string): Promise<number> {
-  const v = value.trim().replace(/^["']|["']$/g, "");
-  const matches = await searchCompanies(v);
-  if (!matches[0]) throw new Error(`Company "${value}" not found in Affinity.`);
-  const best = matches.find((m: any) => looseMatch(m.name, v)) ?? matches[0];
-  return best.id;
+  const v = stripQuotes(value);
+  const candidates = await searchCompanies(v);
+  const picked = await pickBestMatch(v, candidates);
+  if (picked == null) throw new Error(`Company "${value}" not found in Affinity.`);
+  return picked;
 }
 
 // Build the typed value object { type, data } for a write, resolving IDs for

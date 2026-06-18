@@ -143,21 +143,30 @@ async function updateField(term: string, fieldName: string, value: string): Prom
     throw new Error(`Field "${fieldName}" not found on the pipeline list.`);
   }
 
+  const ro = readOnlyReason(field);
+  if (ro) {
+    throw new Error(
+      `"${field.name}" is ${ro} and is read-only via the Affinity API — it can't be set programmatically (even when blank). Use a custom field your team created, or edit it in the Affinity UI.`
+    );
+  }
+
   const entry = await findPipelineEntryByName(term);
   if (!entry) {
     throw new Error(`"${term}" not found in the pipeline list.`);
   }
 
+  const type = field.type ?? field.valueType ?? "text";
   await v2Request(`/v2/lists/${PIPELINE_LIST_ID}/list-entries/${entry.id}/fields`, {
     method: "PATCH",
     body: JSON.stringify({
       operation: "update-fields",
-      fields: [{ id: field.id, value }],
+      fields: [{ id: field.id, value: { type, data: buildFieldData(type, value) } }],
     }),
   });
 
   return {
     updated: true,
+    scope: "pipeline list field",
     entity: entry.entity?.name ?? entry.entity?.fullName ?? term,
     field: field.name,
     value,
@@ -177,6 +186,22 @@ function buildFieldData(type: string, value: string): any {
   return t.endsWith("-multi") ? [scalar] : scalar;
 }
 
+// Returns a reason if a field is read-only via the API (Affinity-enriched /
+// data-partner fields), else null. These can't be written even when blank.
+function readOnlyReason(field: any): string | null {
+  const id = String(field.id ?? "").toLowerCase();
+  const type = String(field.type ?? field.valueType ?? "").toLowerCase();
+  if (id.startsWith("affinity-data-") || id.startsWith("dealroom-")) {
+    return "an Affinity-enriched field (populated by a data partner)";
+  }
+  if (type.startsWith("filterable-text")) {
+    return `type "${type}", which is Affinity-populated`;
+  }
+  const e = field.enrichmentSource ?? field.enrichment_source ?? field.source ?? null;
+  if (e && String(e).toLowerCase() !== "none") return `enriched (source: ${e})`;
+  return null;
+}
+
 async function updateCompanyField(term: string, fieldName: string, value: string): Promise<any> {
   if (READ_ONLY) {
     throw new Error("ARIA is in read-only mode (AFFINITY_READ_ONLY=true); field updates are disabled.");
@@ -191,6 +216,13 @@ async function updateCompanyField(term: string, fieldName: string, value: string
     fields.find((f: any) => (f.name ?? "").toLowerCase() === fn) ||
     fields.find((f: any) => (f.name ?? "").toLowerCase().includes(fn));
   if (!field) throw new Error(`Field "${fieldName}" not found on company profiles.`);
+
+  const ro = readOnlyReason(field);
+  if (ro) {
+    throw new Error(
+      `"${field.name}" is ${ro} and is read-only via the Affinity API — it can't be set programmatically (even when blank). Use a custom field your team created, or edit it in the Affinity UI.`
+    );
+  }
 
   const type = field.type ?? field.valueType ?? "text";
   // Complex types need structured values we can't infer from plain text.
@@ -240,13 +272,14 @@ async function openRouterChat(messages: { role: string; content: string }[]): Pr
 const PLANNER_PROMPT =
   "You convert a request about Activant's Affinity CRM into a SINGLE JSON action. " +
   "Output ONLY raw JSON, no prose, no code fences. Schema: " +
-  '{"action": "search"|"get_company"|"list_pipeline"|"update_field"|"update_company_field"|"answer", ' +
+  '{"action": "search"|"get_company"|"list_pipeline"|"list_fields"|"update_field"|"update_company_field"|"answer", ' +
   '"term"?: string, "field"?: string, "value"?: string, "limit"?: number, "reply"?: string}. ' +
   "Guidance: 'search' to find companies by name/keyword (set term). " +
   "'get_company' for details on one company (set term to its name). " +
   "'list_pipeline' to list entries in the master pipeline (optional limit). " +
-  "'update_field' to change a field on a company's row IN THE MASTER PIPELINE LIST (set term=company name, field, value) — use when the user references the pipeline or a list view. " +
-  "'update_company_field' to change a field on a company's PROFILE directly (a global field that shows everywhere), for any company regardless of lists (set term=company name, field, value) — use for general 'update/set <company>'s <field>' requests. " +
+  "'list_fields' to list the master pipeline's fields and which ones are editable (use for 'what fields can I edit' or to find a writable field). " +
+  "'update_field' is the DEFAULT for changing a field on a company — the editable pipeline fields (e.g. Status, Outreach Status, Sector, Thesis Category, Close Date, Pass Rationale, Excitement Level, Owners) live on the master pipeline list. Set term=company name, field, value. Use this for any 'update/set <company>'s <field>' request unless the user explicitly says the field is a global or company-profile field. " +
+  "'update_company_field' ONLY when the user explicitly asks to change a global / company-profile field rather than a pipeline field (set term=company name, field, value). " +
   "'answer' when no CRM lookup is needed (set reply to the text). " +
   "Use the conversation context to resolve references like 'it' or 'that company'." +
   (READ_ONLY
@@ -325,6 +358,17 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
       case "list_pipeline":
         result = { pipeline: await listPipeline(action.limit ?? 25) };
         break;
+      case "list_fields": {
+        const lf = await getListFields();
+        result = {
+          fields: lf.map((f: any) => ({
+            name: f.name,
+            type: f.type ?? f.valueType ?? null,
+            editable: !readOnlyReason(f),
+          })),
+        };
+        break;
+      }
       case "update_field":
         result = await updateField(action.term ?? "", action.field ?? "", String(action.value ?? ""));
         break;

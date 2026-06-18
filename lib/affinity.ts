@@ -113,16 +113,39 @@ async function getListFields(): Promise<any[]> {
   return data.data ?? data ?? [];
 }
 
+// Loose matching: lowercase and strip punctuation/spaces so "amari ai",
+// "Amari.ai", and "amari-ai" all compare equal.
+function normalizeName(s: string): string {
+  return String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function looseMatch(candidate: string, query: string): boolean {
+  const c = normalizeName(candidate);
+  const q = normalizeName(query);
+  if (!c || !q) return false;
+  if (c === q) return true;
+  if (q.length >= 3 && c.includes(q)) return true;
+  if (c.length >= 3 && q.includes(c)) return true;
+  return false;
+}
+
+// Find a field by name, tolerant of case/punctuation and singular/plural
+// (e.g. "owner" matches "Owners", "outreach" matches "Outreach Status").
+function findField(fields: any[], fieldName: string): any | undefined {
+  return (
+    fields.find((f: any) => normalizeName(f.name) === normalizeName(fieldName)) ||
+    fields.find((f: any) => looseMatch(f.name, fieldName))
+  );
+}
+
 async function findPipelineEntryByName(name: string): Promise<any | null> {
-  const target = name.trim().toLowerCase();
-  // Scan up to ~300 entries across a few pages, matching by entity name.
+  // Scan up to ~300 entries across a few pages, loose-matching by entity name.
   let url: string | null = `/v2/lists/${PIPELINE_LIST_ID}/list-entries?limit=100`;
   for (let page = 0; page < 3 && url; page++) {
     const data: any = await v2Request(url);
     const rows = data.data ?? data ?? [];
     for (const e of rows) {
-      const nm = (e.entity?.name ?? e.entity?.fullName ?? "").toLowerCase();
-      if (nm === target || nm.includes(target)) return e;
+      if (looseMatch(e.entity?.name ?? e.entity?.fullName ?? "", name)) return e;
     }
     const next = data.pagination?.nextUrl ?? null;
     url = next ? next.replace(AFFINITY_BASE, "") : null;
@@ -135,10 +158,7 @@ async function updateField(term: string, fieldName: string, value: string): Prom
     throw new Error("ARIA is in read-only mode (AFFINITY_READ_ONLY=true); field updates are disabled.");
   }
   const fields = await getListFields();
-  const fn = fieldName.trim().toLowerCase();
-  const field =
-    fields.find((f: any) => (f.name ?? "").toLowerCase() === fn) ||
-    fields.find((f: any) => (f.name ?? "").toLowerCase().includes(fn));
+  const field = findField(fields, fieldName);
   if (!field) {
     throw new Error(`Field "${fieldName}" not found on the pipeline list.`);
   }
@@ -237,13 +257,16 @@ async function resolvePersonId(value: string): Promise<number> {
   }
   const matches = await searchPersons(v);
   if (!matches[0]) throw new Error(`Person "${value}" not found in Affinity.`);
-  return matches[0].id;
+  const best = matches.find((m: any) => looseMatch(m.name, v)) ?? matches[0];
+  return best.id;
 }
 
 async function resolveCompanyId(value: string): Promise<number> {
-  const matches = await searchCompanies(value.trim().replace(/^["']|["']$/g, ""));
+  const v = value.trim().replace(/^["']|["']$/g, "");
+  const matches = await searchCompanies(v);
   if (!matches[0]) throw new Error(`Company "${value}" not found in Affinity.`);
-  return matches[0].id;
+  const best = matches.find((m: any) => looseMatch(m.name, v)) ?? matches[0];
+  return best.id;
 }
 
 // Build the typed value object { type, data } for a write, resolving IDs for
@@ -306,10 +329,7 @@ async function updateCompanyField(term: string, fieldName: string, value: string
   if (!company) throw new Error(`Company "${term}" not found.`);
 
   const fields = await getCompanyFields();
-  const fn = fieldName.trim().toLowerCase();
-  const field =
-    fields.find((f: any) => (f.name ?? "").toLowerCase() === fn) ||
-    fields.find((f: any) => (f.name ?? "").toLowerCase().includes(fn));
+  const field = findField(fields, fieldName);
   if (!field) throw new Error(`Field "${fieldName}" not found on company profiles.`);
 
   const ro = readOnlyReason(field);

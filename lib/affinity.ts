@@ -159,11 +159,12 @@ async function updateField(term: string, fieldName: string, value: string): Prom
   if (!valueType) {
     throw new Error(`Couldn't determine the value type of "${field.name}" — not writing to avoid corrupting it.`);
   }
+  const valueObject = await buildValue(valueType, value);
   await v2Request(
     `/v2/lists/${PIPELINE_LIST_ID}/list-entries/${entry.id}/fields/${field.id}`,
     {
       method: "POST",
-      body: JSON.stringify({ value: { type: valueType, data: buildValueData(valueType, value) } }),
+      body: JSON.stringify({ value: valueObject }),
     }
   );
 
@@ -206,21 +207,77 @@ function valueTypeOf(field: any): string | null {
   return null;
 }
 
-// Build the `data` payload for a typed value object, per value type.
-function buildValueData(valueType: string, value: string): any {
-  switch (valueType.toLowerCase()) {
-    case "text": return value;
-    case "text-multi": return [value];
-    case "number": return Number(value);
-    case "number-multi": return [Number(value)];
-    case "datetime": return value; // YYYY-MM-DD (the API ignores any time part)
-    case "dropdown": return { text: value };
-    case "dropdown-multi": return [{ text: value }];
-    case "ranked-dropdown": return { text: value };
-    default:
+// Split a string like "Ben Bradlow, Malek Debrabander" into parts for -multi fields.
+function splitMulti(value: string): string[] {
+  return value.split(/\s*(?:,|;|&|\band\b)\s*/i).map((s) => s.trim()).filter(Boolean);
+}
+
+async function whoami(): Promise<any> {
+  return v2Request(`/v2/auth/whoami`);
+}
+
+async function searchPersons(term: string): Promise<any[]> {
+  const data = await v1Get(`/persons?term=${encodeURIComponent(term)}`);
+  return (data.persons ?? []).slice(0, 5).map((p: any) => ({
+    id: p.id,
+    name: [p.first_name, p.last_name].filter(Boolean).join(" "),
+    email: p.primary_email ?? p.emails?.[0] ?? null,
+  }));
+}
+
+async function resolvePersonId(value: string): Promise<number> {
+  const v = value.trim().replace(/^["']|["']$/g, "");
+  if (/^(me|myself|i|current user)$/i.test(v)) {
+    const who = await whoami();
+    const email = who?.user?.emailAddress;
+    if (email) {
+      const byEmail = await searchPersons(email);
+      if (byEmail[0]) return byEmail[0].id;
+    }
+  }
+  const matches = await searchPersons(v);
+  if (!matches[0]) throw new Error(`Person "${value}" not found in Affinity.`);
+  return matches[0].id;
+}
+
+async function resolveCompanyId(value: string): Promise<number> {
+  const matches = await searchCompanies(value.trim().replace(/^["']|["']$/g, ""));
+  if (!matches[0]) throw new Error(`Company "${value}" not found in Affinity.`);
+  return matches[0].id;
+}
+
+// Build the typed value object { type, data } for a write, resolving IDs for
+// person/company fields. Covers every writable Affinity value type.
+async function buildValue(valueType: string, value: string): Promise<any> {
+  const t = valueType.toLowerCase();
+  const clean = value.trim().replace(/^["']|["']$/g, "");
+  switch (t) {
+    case "text": return { type: t, data: clean };
+    case "number": return { type: t, data: Number(clean) };
+    case "number-multi": return { type: t, data: splitMulti(value).map(Number) };
+    case "datetime": return { type: t, data: clean }; // YYYY-MM-DD; API ignores time
+    case "dropdown": return { type: t, data: { text: clean } };
+    case "dropdown-multi": return { type: t, data: splitMulti(value).map((text) => ({ text })) };
+    case "ranked-dropdown": return { type: t, data: { text: clean } };
+    case "person": return { type: t, data: { id: await resolvePersonId(clean) } };
+    case "person-multi": {
+      const out = [];
+      for (const n of splitMulti(value)) out.push({ id: await resolvePersonId(n) });
+      return { type: t, data: out };
+    }
+    case "company": return { type: t, data: { id: await resolveCompanyId(clean) } };
+    case "company-multi": {
+      const out = [];
+      for (const n of splitMulti(value)) out.push({ id: await resolveCompanyId(n) });
+      return { type: t, data: out };
+    }
+    case "location":
+    case "location-multi":
       throw new Error(
-        `Field type "${valueType}" needs a structured value (e.g. an ID or address) that I can't set from plain text yet.`
+        `"${valueType}" fields need a structured address (city/state/country) I can't reliably parse from plain text — set it in the Affinity UI.`
       );
+    default:
+      throw new Error(`Field type "${valueType}" isn't supported for chat-based updates yet.`);
   }
 }
 
@@ -266,9 +323,10 @@ async function updateCompanyField(term: string, fieldName: string, value: string
   if (!valueType) {
     throw new Error(`Couldn't determine the value type of "${field.name}" — not writing to avoid corrupting it.`);
   }
+  const valueObject = await buildValue(valueType, value);
   await v2Request(`/v2/companies/${company.id}/fields/${field.id}`, {
     method: "POST",
-    body: JSON.stringify({ value: { type: valueType, data: buildValueData(valueType, value) } }),
+    body: JSON.stringify({ value: valueObject }),
   });
 
   return {

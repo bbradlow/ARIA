@@ -160,7 +160,7 @@ async function updateField(term: string, fieldName: string, value: string): Prom
     method: "PATCH",
     body: JSON.stringify({
       operation: "update-fields",
-      fields: [{ id: field.id, value: { type, data: buildFieldData(type, value) } }],
+      updates: [{ fieldId: field.id, value: { type, data: buildFieldData(type, value) } }],
     }),
   });
 

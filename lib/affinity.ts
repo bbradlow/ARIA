@@ -155,14 +155,17 @@ async function updateField(term: string, fieldName: string, value: string): Prom
     throw new Error(`"${term}" not found in the pipeline list.`);
   }
 
-  const type = field.type ?? field.valueType ?? "text";
-  await v2Request(`/v2/lists/${PIPELINE_LIST_ID}/list-entries/${entry.id}/fields`, {
-    method: "PATCH",
-    body: JSON.stringify({
-      operation: "update-fields",
-      updates: [{ fieldId: field.id, value: { type, data: buildFieldData(type, value) } }],
-    }),
-  });
+  const valueType = valueTypeOf(field);
+  if (!valueType) {
+    throw new Error(`Couldn't determine the value type of "${field.name}" — not writing to avoid corrupting it.`);
+  }
+  await v2Request(
+    `/v2/lists/${PIPELINE_LIST_ID}/list-entries/${entry.id}/fields/${field.id}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ value: { type: valueType, data: buildValueData(valueType, value) } }),
+    }
+  );
 
   return {
     updated: true,
@@ -180,22 +183,57 @@ async function getCompanyFields(): Promise<any[]> {
   return data.data ?? data ?? [];
 }
 
-function buildFieldData(type: string, value: string): any {
-  const t = String(type).toLowerCase();
-  const scalar = t.startsWith("number") ? Number(value) : value;
-  return t.endsWith("-multi") ? [scalar] : scalar;
+// Affinity v2 value-type discriminators.
+const VALUE_TYPES = new Set([
+  "text", "text-multi", "number", "number-multi", "datetime",
+  "dropdown", "dropdown-multi", "ranked-dropdown",
+  "location", "location-multi", "person", "person-multi",
+  "company", "company-multi", "filterable-text", "filterable-text-multi",
+]);
+
+// A field's "type" in v2 metadata is its SCOPE (list/global/enriched); the
+// value type needed for a write discriminator is the separate "data type".
+// Property names vary, so prefer known keys, then scan for a recognized type.
+function valueTypeOf(field: any): string | null {
+  for (const k of ["dataType", "data_type", "valueType", "value_type"]) {
+    const v = field?.[k];
+    if (typeof v === "string" && VALUE_TYPES.has(v.toLowerCase())) return v.toLowerCase();
+  }
+  for (const k of Object.keys(field ?? {})) {
+    const v = field[k];
+    if (typeof v === "string" && VALUE_TYPES.has(v.toLowerCase())) return v.toLowerCase();
+  }
+  return null;
+}
+
+// Build the `data` payload for a typed value object, per value type.
+function buildValueData(valueType: string, value: string): any {
+  switch (valueType.toLowerCase()) {
+    case "text": return value;
+    case "text-multi": return [value];
+    case "number": return Number(value);
+    case "number-multi": return [Number(value)];
+    case "datetime": return value; // YYYY-MM-DD (the API ignores any time part)
+    case "dropdown": return { text: value };
+    case "dropdown-multi": return [{ text: value }];
+    case "ranked-dropdown": return { text: value };
+    default:
+      throw new Error(
+        `Field type "${valueType}" needs a structured value (e.g. an ID or address) that I can't set from plain text yet.`
+      );
+  }
 }
 
 // Returns a reason if a field is read-only via the API (Affinity-enriched /
 // data-partner fields), else null. These can't be written even when blank.
 function readOnlyReason(field: any): string | null {
   const id = String(field.id ?? "").toLowerCase();
-  const type = String(field.type ?? field.valueType ?? "").toLowerCase();
+  const vt = valueTypeOf(field) ?? "";
   if (id.startsWith("affinity-data-") || id.startsWith("dealroom-")) {
     return "an Affinity-enriched field (populated by a data partner)";
   }
-  if (type.startsWith("filterable-text")) {
-    return `type "${type}", which is Affinity-populated`;
+  if (vt.startsWith("filterable-text")) {
+    return `value type "${vt}", which is Affinity-populated`;
   }
   const e = field.enrichmentSource ?? field.enrichment_source ?? field.source ?? null;
   if (e && String(e).toLowerCase() !== "none") return `enriched (source: ${e})`;
@@ -224,15 +262,13 @@ async function updateCompanyField(term: string, fieldName: string, value: string
     );
   }
 
-  const type = field.type ?? field.valueType ?? "text";
-  // Complex types need structured values we can't infer from plain text.
-  if (/^(location|person|company|interaction|filterable)/i.test(String(type)) && !/-multi$/i.test(String(type))) {
-    throw new Error(`Field "${field.name}" is of type "${type}", which needs a structured value I can't set from plain text yet.`);
+  const valueType = valueTypeOf(field);
+  if (!valueType) {
+    throw new Error(`Couldn't determine the value type of "${field.name}" — not writing to avoid corrupting it.`);
   }
-
   await v2Request(`/v2/companies/${company.id}/fields/${field.id}`, {
     method: "POST",
-    body: JSON.stringify({ value: { type, data: buildFieldData(type, value) } }),
+    body: JSON.stringify({ value: { type: valueType, data: buildValueData(valueType, value) } }),
   });
 
   return {

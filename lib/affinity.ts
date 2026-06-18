@@ -80,6 +80,23 @@ async function searchCompanies(term: string): Promise<any[]> {
   }));
 }
 
+// Enriched company profile: industry, description, and other non-list-specific
+// fields. These only come back when fieldTypes is specified.
+async function getCompanyDetails(id: number | string): Promise<any> {
+  const params =
+    "fieldTypes=enriched&fieldTypes=global&fieldTypes=relationship-intelligence";
+  const data = await v2Request(`/v2/companies/${id}?${params}`);
+  const fields = (data.fields ?? [])
+    .map((f: any) => ({ name: f.name, value: f.value?.data ?? f.value ?? null }))
+    .filter((f: any) => f.value !== null && f.value !== undefined && f.value !== "");
+  return {
+    id: data.id ?? id,
+    name: data.name ?? null,
+    domain: data.domain ?? data.domains?.[0] ?? null,
+    fields,
+  };
+}
+
 async function listPipeline(limit: number): Promise<any[]> {
   const n = Math.min(Math.max(limit || 25, 1), 100);
   const data = await v2Request(`/v2/lists/${PIPELINE_LIST_ID}/list-entries?limit=${n}`);
@@ -147,6 +164,54 @@ async function updateField(term: string, fieldName: string, value: string): Prom
   };
 }
 
+// Update a GLOBAL field on a company's profile directly (any company, not tied
+// to a list). Uses the company endpoint with a typed value object.
+async function getCompanyFields(): Promise<any[]> {
+  const data = await v2Request(`/v2/companies/fields`);
+  return data.data ?? data ?? [];
+}
+
+function buildFieldData(type: string, value: string): any {
+  const t = String(type).toLowerCase();
+  const scalar = t.startsWith("number") ? Number(value) : value;
+  return t.endsWith("-multi") ? [scalar] : scalar;
+}
+
+async function updateCompanyField(term: string, fieldName: string, value: string): Promise<any> {
+  if (READ_ONLY) {
+    throw new Error("ARIA is in read-only mode (AFFINITY_READ_ONLY=true); field updates are disabled.");
+  }
+  const matches = await searchCompanies(term);
+  const company = matches[0];
+  if (!company) throw new Error(`Company "${term}" not found.`);
+
+  const fields = await getCompanyFields();
+  const fn = fieldName.trim().toLowerCase();
+  const field =
+    fields.find((f: any) => (f.name ?? "").toLowerCase() === fn) ||
+    fields.find((f: any) => (f.name ?? "").toLowerCase().includes(fn));
+  if (!field) throw new Error(`Field "${fieldName}" not found on company profiles.`);
+
+  const type = field.type ?? field.valueType ?? "text";
+  // Complex types need structured values we can't infer from plain text.
+  if (/^(location|person|company|interaction|filterable)/i.test(String(type)) && !/-multi$/i.test(String(type))) {
+    throw new Error(`Field "${field.name}" is of type "${type}", which needs a structured value I can't set from plain text yet.`);
+  }
+
+  await v2Request(`/v2/companies/${company.id}/fields/${field.id}`, {
+    method: "POST",
+    body: JSON.stringify({ value: { type, data: buildFieldData(type, value) } }),
+  });
+
+  return {
+    updated: true,
+    scope: "company profile (global field)",
+    entity: company.name,
+    field: field.name,
+    value,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // LLM helpers (OpenRouter) — one to plan, one to phrase the result.
 // ---------------------------------------------------------------------------
@@ -175,16 +240,17 @@ async function openRouterChat(messages: { role: string; content: string }[]): Pr
 const PLANNER_PROMPT =
   "You convert a request about Activant's Affinity CRM into a SINGLE JSON action. " +
   "Output ONLY raw JSON, no prose, no code fences. Schema: " +
-  '{"action": "search"|"get_company"|"list_pipeline"|"update_field"|"answer", ' +
+  '{"action": "search"|"get_company"|"list_pipeline"|"update_field"|"update_company_field"|"answer", ' +
   '"term"?: string, "field"?: string, "value"?: string, "limit"?: number, "reply"?: string}. ' +
   "Guidance: 'search' to find companies by name/keyword (set term). " +
   "'get_company' for details on one company (set term to its name). " +
   "'list_pipeline' to list entries in the master pipeline (optional limit). " +
-  "'update_field' to change a field on a pipeline company (set term=company name, field=field name, value=new value). " +
+  "'update_field' to change a field on a company's row IN THE MASTER PIPELINE LIST (set term=company name, field, value) — use when the user references the pipeline or a list view. " +
+  "'update_company_field' to change a field on a company's PROFILE directly (a global field that shows everywhere), for any company regardless of lists (set term=company name, field, value) — use for general 'update/set <company>'s <field>' requests. " +
   "'answer' when no CRM lookup is needed (set reply to the text). " +
   "Use the conversation context to resolve references like 'it' or 'that company'." +
   (READ_ONLY
-    ? " READ-ONLY MODE: never use update_field; if asked to change data, use action 'answer' explaining you are read-only."
+    ? " READ-ONLY MODE: never use update_field or update_company_field; if asked to change data, use action 'answer' explaining you are read-only."
     : "");
 
 function latestUserText(history: ThreadMessage[]): string {
@@ -244,7 +310,16 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
         break;
       case "get_company": {
         const matches = await searchCompanies(action.term ?? request);
-        result = { company: matches[0] ?? null, otherMatches: matches.slice(1) };
+        const top = matches[0] ?? null;
+        let company: any = top;
+        if (top) {
+          try {
+            company = await getCompanyDetails(top.id);
+          } catch (e) {
+            console.error("Company enrichment failed, using basic record:", e);
+          }
+        }
+        result = { company, otherMatches: matches.slice(1) };
         break;
       }
       case "list_pipeline":
@@ -252,6 +327,9 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
         break;
       case "update_field":
         result = await updateField(action.term ?? "", action.field ?? "", String(action.value ?? ""));
+        break;
+      case "update_company_field":
+        result = await updateCompanyField(action.term ?? "", action.field ?? "", String(action.value ?? ""));
         break;
       default:
         return "I wasn't sure what to do with that — try rephrasing.";
@@ -265,7 +343,7 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
   const RESPONDER_PROMPT =
     "You are ARIA, a CRM assistant for Activant Capital. Given a user request and the raw JSON result from Affinity, write a concise Slack answer. " +
     "Use Slack formatting: single asterisks for *bold*, '•' for bullets, no markdown headers. " +
-    "State facts from the data only; if the result is empty, say nothing matched. For an update, confirm exactly what changed.";
+    "State facts from the data only; if the result is empty, say nothing matched. When a company has enriched fields (industry, description, location, headcount, etc.), surface the most useful ones. For an update, confirm exactly what changed.";
 
   return await openRouterChat([
     { role: "system", content: RESPONDER_PROMPT },

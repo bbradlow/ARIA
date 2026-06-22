@@ -19,3 +19,35 @@ export async function retrieve(question: string, matchCount = 6): Promise<Retrie
   if (error) throw error;
   return (data ?? []) as RetrievedChunk[];
 }
+
+export interface ArticleMeta {
+  article_title: string;
+  article_url: string | null;
+  published_at: string | null;
+}
+
+/**
+ * Distinct list of every ingested article with its publication date, sorted
+ * newest first (undated last). Lets the QA layer answer recency/listing/count
+ * questions that pure semantic search can't (e.g. "what's the latest article").
+ */
+export async function listArticleIndex(): Promise<ArticleMeta[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("research_chunks")
+    .select("article_title, article_url, published_at");
+  if (error) throw error;
+
+  const byKey = new Map<string, ArticleMeta>();
+  for (const r of (data ?? []) as ArticleMeta[]) {
+    const key = r.article_url ?? r.article_title;
+    if (!byKey.has(key)) byKey.set(key, r);
+  }
+
+  return [...byKey.values()].sort((a, b) => {
+    if (!a.published_at && !b.published_at) return 0;
+    if (!a.published_at) return 1; // undated last
+    if (!b.published_at) return -1;
+    return b.published_at.localeCompare(a.published_at); // newest first
+  });
+}

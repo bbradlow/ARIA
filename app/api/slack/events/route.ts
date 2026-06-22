@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { waitUntil } from "@vercel/functions";
 import { getSupabase } from "@/lib/supabase";
 import { postSlackMessage, updateSlackMessage, getBotUserId, getRecentMessages, getThreadMessages, getThreadRootText, verifySlackSignature } from "@/lib/slack";
-import { answerQuestion } from "@/lib/qa";
+import { answerQuestion, researchJoke } from "@/lib/qa";
 import { askAffinity, latestReachouts } from "@/lib/affinity";
 
 // node crypto (signature verification) requires the Node.js runtime.
@@ -48,6 +48,21 @@ interface SlackEnvelope {
 
 function stripMention(text: string, botId: string): string {
   return (text || "").replace(new RegExp(`<@${botId}>`, "g"), "").trim();
+}
+
+// $joke: a one-line joke riffing on the research embedding library. Returns true if handled.
+async function tryJoke(channel: string, text: string, replyTo?: string): Promise<boolean> {
+  if (!/^\$joke\b/i.test(text.trim())) return false;
+  try {
+    const joke = await researchJoke();
+    await postSlackMessage(channel, joke, replyTo);
+  } catch (err) {
+    console.error("Joke handler failed:", err);
+    try {
+      await postSlackMessage(channel, "Sorry — couldn't come up with one right now.", replyTo);
+    } catch {}
+  }
+  return true;
 }
 
 // $afflat: a batch reach-out report for a list of companies (comma- or
@@ -173,6 +188,7 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
     } else if (cmd === "help" || cmd === "") {
       await postSlackMessage(event.channel, HELP_REPLY);
     } else {
+      if (await tryJoke(event.channel, text, event.thread_ts ?? event.ts)) return;
       if (await tryAffinityLatest(event.channel, text, event.thread_ts ?? event.ts)) return;
       let botId = "";
       try {
@@ -206,6 +222,7 @@ async function handleChannelMention(event: SlackEvent): Promise<void> {
   const threadTs = event.thread_ts ?? event.ts;
 
   try {
+    if (await tryJoke(event.channel, question, event.thread_ts ?? event.ts)) return;
     if (await tryAffinityLatest(event.channel, question, event.thread_ts ?? event.ts)) return;
     if (await tryAffinity(event.channel, question, botId, event.thread_ts ?? event.ts, event.thread_ts)) return;
     const answer = await answerQuestion(question);
@@ -273,6 +290,7 @@ async function handleGroupMessage(event: SlackEvent): Promise<void> {
     }
     if (mentioned) {
       // A question directed at the bot (doesn't change summary subscription).
+      if (await tryJoke(channel, stripped, event.thread_ts ?? event.ts)) return;
       if (await tryAffinityLatest(channel, stripped, event.thread_ts ?? event.ts)) return;
       if (await tryAffinity(channel, stripped, botId, event.thread_ts ?? event.ts, event.thread_ts)) return;
       const answer = await answerQuestion(stripped);

@@ -14,7 +14,7 @@ export async function postSlackMessage(
   channel: string,
   text: string,
   threadTs?: string
-): Promise<void> {
+): Promise<string | null> {
   const token = process.env.SLACK_BOT_TOKEN;
   if (!token) throw new Error("Missing SLACK_BOT_TOKEN environment variable");
 
@@ -27,9 +27,37 @@ export async function postSlackMessage(
     body: JSON.stringify({ channel, text, ...(threadTs ? { thread_ts: threadTs } : {}) }),
   });
 
-  const data = (await res.json()) as { ok: boolean; error?: string };
+  const data = (await res.json()) as { ok: boolean; ts?: string; error?: string };
   if (!data.ok) {
     throw new Error(`Slack chat.postMessage failed: ${data.error ?? "unknown_error"}`);
+  }
+  return data.ts ?? null;
+}
+
+/**
+ * Edit an existing message (chat.update). Used to replace a "working…"
+ * placeholder with the final answer so long tasks show progress in one message.
+ */
+export async function updateSlackMessage(
+  channel: string,
+  ts: string,
+  text: string
+): Promise<void> {
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!token) throw new Error("Missing SLACK_BOT_TOKEN environment variable");
+
+  const res = await fetch(`${SLACK_API}/chat.update`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({ channel, ts, text }),
+  });
+
+  const data = (await res.json()) as { ok: boolean; error?: string };
+  if (!data.ok) {
+    throw new Error(`Slack chat.update failed: ${data.error ?? "unknown_error"}`);
   }
 }
 
@@ -101,6 +129,77 @@ export async function getThreadMessages(
     out.push({ role: isBot ? "assistant" : "user", content });
   }
   return out;
+}
+
+/**
+ * Fetch recent conversation messages (via conversations.history) as role-tagged
+ * turns, filtered to the ARIA conversation only: bot messages, plus user messages
+ * that mention the bot or start with "$aff". This gives multi-turn context when
+ * replying flat (not in a thread) without pulling in unrelated channel chatter.
+ * Returns chronological order (oldest first). Requires the matching history scope.
+ */
+/**
+ * Raw text of a thread's root (parent) message. Used to detect whether a thread
+ * was started with a $aff command so follow-ups can stay in Affinity mode.
+ */
+export async function getThreadRootText(channel: string, threadTs: string): Promise<string> {
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!token) throw new Error("Missing SLACK_BOT_TOKEN environment variable");
+
+  const params = new URLSearchParams({ channel, ts: threadTs, limit: "1" });
+  const res = await fetch(`${SLACK_API}/conversations.replies?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = (await res.json()) as {
+    ok: boolean;
+    error?: string;
+    messages?: { text?: string }[];
+  };
+  if (!data.ok) {
+    throw new Error(`Slack conversations.replies failed: ${data.error ?? "unknown_error"}`);
+  }
+  return data.messages?.[0]?.text ?? "";
+}
+
+export async function getRecentMessages(
+  channel: string,
+  botUserId: string,
+  limit = 12
+): Promise<ThreadMessage[]> {
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!token) throw new Error("Missing SLACK_BOT_TOKEN environment variable");
+
+  // Over-fetch since filtering drops unrelated messages.
+  const params = new URLSearchParams({ channel, limit: String(Math.max(limit * 3, 30)) });
+  const res = await fetch(`${SLACK_API}/conversations.history?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = (await res.json()) as {
+    ok: boolean;
+    error?: string;
+    messages?: { user?: string; bot_id?: string; text?: string; subtype?: string }[];
+  };
+  if (!data.ok) {
+    throw new Error(`Slack conversations.history failed: ${data.error ?? "unknown_error"}`);
+  }
+
+  const mentionRe = new RegExp(`<@${botUserId}>`, "g");
+  const collected: ThreadMessage[] = [];
+  // conversations.history returns newest-first.
+  for (const m of data.messages ?? []) {
+    if (m.subtype && m.subtype !== "bot_message") continue;
+    const isBot = !!m.bot_id || m.user === botUserId;
+    const raw = m.text ?? "";
+    const isAffinityUserMsg =
+      !isBot && (raw.includes(`<@${botUserId}>`) || /^\s*\$aff\b/i.test(raw));
+    if (!isBot && !isAffinityUserMsg) continue; // drop unrelated chatter
+    let content = raw.replace(mentionRe, "").trim();
+    if (!isBot) content = content.replace(/^\$aff\b/i, "").trim();
+    if (!content) continue;
+    collected.push({ role: isBot ? "assistant" : "user", content });
+  }
+  collected.reverse(); // chronological
+  return collected.slice(-limit);
 }
 
 /**

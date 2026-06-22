@@ -379,8 +379,8 @@ async function buildValue(valueType: string, value: string, options?: any[]): Pr
     }
     case "ranked-dropdown": {
       const opt = options ? await matchOption(clean, options) : null;
-      // Ranked dropdowns require the rank, not just the text.
-      if (opt) return { type: t, data: { text: opt.text, rank: opt.rank } };
+      // Ranked dropdowns reference the option by its id.
+      if (opt) return { type: t, data: { id: opt.id } };
       return { type: t, data: { text: clean } };
     }
     case "person": return { type: t, data: { id: await resolvePersonId(clean) } };
@@ -489,8 +489,8 @@ const PLANNER_PROMPT =
   "Output ONLY raw JSON, no prose, no code fences. Schema: " +
   '{"action": "search"|"get_company"|"list_pipeline"|"list_fields"|"update_field"|"update_company_field"|"answer", ' +
   '"term"?: string, "field"?: string, "value"?: string, "limit"?: number, "reply"?: string}. ' +
-  "Guidance: 'search' to find companies by name/keyword (set term). " +
-  "'get_company' for details on one company (set term to its name). " +
+  "Guidance: 'search' to find or list companies by name/keyword when the user just wants to locate matches (set term); returns only basic identifiers, no enriched details. " +
+  "'get_company' for details/info/overview about a specific company — use this whenever the user asks for information about a named company, EVEN IF they say 'search', 'look up', or 'find info on' (set term to the company name). " +
   "'list_pipeline' to list entries in the master pipeline (optional limit). " +
   "'list_fields' to list the master pipeline's fields and which ones are editable (use for 'what fields can I edit' or to find a writable field). " +
   "'update_field' is the DEFAULT for changing a field on a company — the editable pipeline fields (e.g. Status, Outreach Status, Sector, Thesis Category, Close Date, Pass Rationale, Excitement Level, Owners) live on the master pipeline list. Set term=company name, field, value. Use this for any 'update/set <company>'s <field>' request unless the user explicitly says the field is a global or company-profile field. " +
@@ -553,9 +553,20 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
   let result: any;
   try {
     switch (action.action) {
-      case "search":
-        result = { matches: await searchCompanies(action.term ?? request) };
+      case "search": {
+        const matches = await searchCompanies(action.term ?? request);
+        // Backstop: if there's a single clear match, enrich it — covers
+        // "use search and give me info on X" routing to search.
+        if (matches.length === 1) {
+          try {
+            matches[0] = await getCompanyDetails(matches[0].id);
+          } catch (e) {
+            console.error("Search enrichment failed, using basic record:", e);
+          }
+        }
+        result = { matches };
         break;
+      }
       case "get_company": {
         const matches = await searchCompanies(action.term ?? request);
         const top = matches[0] ?? null;
@@ -611,4 +622,131 @@ export async function askAffinity(history: ThreadMessage[]): Promise<string> {
       content: `Request: ${request}\n\nAffinity result (JSON):\n${JSON.stringify(result).slice(0, 6000)}\n\nWrite the Slack answer.`,
     },
   ]);
+}
+
+// ===========================================================================
+// $afflat — batch "latest reach-out" report for a list of companies.
+// Returns, per company: most recent reach-out date, # of reach-outs (if the
+// data exposes a count), key people involved, and the Owners field.
+// ===========================================================================
+
+function parseCompanyList(text: string): { companies: string[]; truncated: boolean } {
+  const body = text.replace(/^\s*\$afflat\b/i, "").trim();
+  const all = body
+    .split(/[\n,]+/)
+    .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean);
+  return { companies: all.slice(0, 20), truncated: all.length > 20 };
+}
+
+async function runWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < items.length) {
+      const idx = next++;
+      try {
+        results[idx] = await fn(items[idx]);
+      } catch (err) {
+        results[idx] = { error: err instanceof Error ? err.message : String(err) } as any;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+const personNameCache = new Map<number, string>();
+async function personName(id: number): Promise<string> {
+  if (personNameCache.has(id)) return personNameCache.get(id) as string;
+  try {
+    const p = await v1Get(`/persons/${id}`);
+    const name = [p.first_name, p.last_name].filter(Boolean).join(" ") || p.name || `Person ${id}`;
+    personNameCache.set(id, name);
+    return name;
+  } catch {
+    return `Person ${id}`;
+  }
+}
+
+function personIdsFromValue(value: any): number[] {
+  const d = value?.data ?? value;
+  const arr = Array.isArray(d) ? d : d != null ? [d] : [];
+  return arr.map((x: any) => (typeof x === "number" ? x : x?.id)).filter((x: any) => typeof x === "number");
+}
+
+// Read the Owners field for a company's pipeline list entry → person names.
+async function ownersForCompany(companyId: number, ownersFieldId: string | null): Promise<string[]> {
+  if (!ownersFieldId) return [];
+  try {
+    const data = await v2Request(`/v2/companies/${companyId}/list-entries`);
+    const entries = data.data ?? data ?? [];
+    const entry =
+      entries.find((e: any) => String(e.listId ?? e.list?.id) === String(PIPELINE_LIST_ID)) ?? entries[0];
+    if (!entry?.id) return [];
+    const val = await v2Request(`/v2/lists/${PIPELINE_LIST_ID}/list-entries/${entry.id}/fields/${ownersFieldId}`);
+    const ids = personIdsFromValue(val.value ?? val);
+    return await Promise.all(ids.map(personName));
+  } catch {
+    return [];
+  }
+}
+
+async function reachoutForCompany(name: string, ownersFieldId: string | null): Promise<any> {
+  const matches = await searchCompanies(name);
+  const top = matches.find((m: any) => looseMatch(m.name, name)) ?? matches[0];
+  if (!top) return { input: name, found: false };
+  const [details, owners] = await Promise.all([
+    getCompanyDetails(top.id).catch(() => ({ fields: [] as any[] })),
+    ownersForCompany(top.id, ownersFieldId),
+  ]);
+  // Keep only fields relevant to reach-out / people, trimmed, to bound prompt size.
+  const relevant = ((details as any).fields ?? [])
+    .filter((f: any) =>
+      /email|contact|interaction|meeting|event|chat|people|person|introduc|owner|source/i.test(f.name ?? "")
+    )
+    .slice(0, 10)
+    .map((f: any) => ({
+      name: f.name,
+      value: typeof f.value === "string" ? f.value.slice(0, 200) : f.value,
+    }));
+  return { input: name, found: true, company: top.name, owners, fields: relevant };
+}
+
+export async function latestReachouts(text: string): Promise<string> {
+  const { companies, truncated } = parseCompanyList(text);
+  if (!companies.length) {
+    return "Send `$afflat` followed by up to 20 companies — comma-separated or one per line.";
+  }
+
+  // Resolve the Owners field id once for the pipeline.
+  let ownersFieldId: string | null = null;
+  try {
+    const fields = await getListFields();
+    ownersFieldId = findField(fields, "Owners")?.id ?? null;
+  } catch {}
+
+  const summaries = await runWithConcurrency(companies, 6, (c) => reachoutForCompany(c, ownersFieldId));
+
+  const RESPONDER =
+    "You are ARIA. For EACH company, report exactly four things from the provided Affinity data: " +
+    "1) Last reach-out — the most recent date across any email/interaction/contact/meeting field; if none, 'no contact logged'; " +
+    "2) Times reached out — only if a count is present in the data, otherwise 'n/a'; " +
+    "3) Key people — people named in the interaction/intro/contact fields; " +
+    "4) Owners — from the provided owners list ('none' if empty). " +
+    "If a company has found=false, show it as 'not found in Affinity'. " +
+    "Format as a Slack message, one block per company: a *Company Name* header then four '•' bullet lines labeled Last reach-out / Times reached out / Key people / Owners. " +
+    "Use single asterisks for bold. Be concise. Use ONLY the data given — never invent dates, counts, or names.";
+
+  const report = await openRouterChat([
+    { role: "system", content: RESPONDER },
+    {
+      role: "user",
+      content: `Companies and their Affinity data (JSON):\n${JSON.stringify(summaries).slice(0, 20000)}\n\nWrite the report.`,
+    },
+  ]);
+
+  return truncated
+    ? report + "\n\n_(Only the first 20 companies were processed.)_"
+    : report;
 }

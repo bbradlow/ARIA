@@ -1,14 +1,17 @@
 import { NextRequest } from "next/server";
 import { waitUntil } from "@vercel/functions";
 import { getSupabase } from "@/lib/supabase";
-import { postSlackMessage, getBotUserId, getThreadMessages, verifySlackSignature } from "@/lib/slack";
+import { postSlackMessage, updateSlackMessage, getBotUserId, getRecentMessages, getThreadMessages, getThreadRootText, verifySlackSignature } from "@/lib/slack";
 import { answerQuestion } from "@/lib/qa";
-import { askAffinity } from "@/lib/affinity";
+import { askAffinity, latestReachouts } from "@/lib/affinity";
 
 // node crypto (signature verification) requires the Node.js runtime.
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// Raised so multi-step Affinity writes can finish. NOTE: cap by your Vercel
+// plan — Hobby max is 60, Pro allows up to 300. If a deploy fails on this line,
+// lower it to your plan's limit (and lower AFFINITY_TIMEOUT_MS to match).
+export const maxDuration = 300;
 
 const SUBSCRIBE_REPLY =
   "✅ You're subscribed! You'll receive a DM summary every time a new Activant Capital research newsletter arrives.";
@@ -47,28 +50,95 @@ function stripMention(text: string, botId: string): string {
   return (text || "").replace(new RegExp(`<@${botId}>`, "g"), "").trim();
 }
 
-// If the (mention-stripped) text starts with $aff, route to the Affinity CRM
-// handler: pull the full thread for multi-turn context, answer via Claude + the
-// Affinity MCP server, and reply in-thread. Returns true if it handled the message.
+// $afflat: a batch reach-out report for a list of companies (comma- or
+// newline-separated). One-shot — no thread continuation. Returns true if handled.
+async function tryAffinityLatest(
+  channel: string,
+  text: string,
+  replyTo?: string
+): Promise<boolean> {
+  if (!/^\$afflat\b/i.test(text.trim())) return false;
+
+  let placeholderTs: string | null = null;
+  try {
+    placeholderTs = await postSlackMessage(channel, "_Pulling latest reach-out data from Affinity…_", replyTo);
+  } catch {}
+
+  try {
+    const answer = await latestReachouts(text);
+    if (placeholderTs) await updateSlackMessage(channel, placeholderTs, answer);
+    else await postSlackMessage(channel, answer, replyTo);
+  } catch (err) {
+    console.error("Affinity latest handler failed:", err);
+    const reason = err instanceof Error ? err.message : String(err);
+    const msg = `Sorry — I hit an error building the reach-out report.\n\`${reason.slice(0, 300)}\``;
+    try {
+      if (placeholderTs) await updateSlackMessage(channel, placeholderTs, msg);
+      else await postSlackMessage(channel, msg, replyTo);
+    } catch {}
+  }
+  return true;
+}
+
+// Route to the Affinity CRM handler when the message either (a) starts with
+// $aff, or (b) is a reply inside a thread that was started with $aff — so you
+// don't have to repeat the prefix to keep talking to Affinity in that thread.
+// Replies post into the thread rooted at the triggering message (replyTo), and
+// multi-turn context is that thread's history. Returns true if handled.
 async function tryAffinity(
   channel: string,
   text: string,
-  threadTs: string,
-  botId: string
+  botId: string,
+  replyTo?: string,
+  threadTs?: string
 ): Promise<boolean> {
-  if (!/^\$aff\b/i.test(text.trim())) return false;
+  const trimmed = text.trim();
+  const isExplicit = /^\$aff\b/i.test(trimmed);
+
+  // No prefix, but in a thread? Continue Affinity mode if the thread's root
+  // message was a $aff command.
+  let inAffinityThread = false;
+  if (!isExplicit && threadTs) {
+    try {
+      const root = await getThreadRootText(channel, threadTs);
+      inAffinityThread = /^\$aff\b/i.test(root.replace(/<@\w+>/g, "").trim());
+    } catch (err) {
+      console.error("Affinity thread check failed:", err);
+    }
+  }
+  if (!isExplicit && !inAffinityThread) return false;
+
+  // Gather context BEFORE posting the placeholder, so it isn't fed back as input.
+  let history: { role: "user" | "assistant"; content: string }[] = [];
+  try {
+    history = replyTo
+      ? await getThreadMessages(channel, replyTo, botId)
+      : await getRecentMessages(channel, botId, 12);
+  } catch (err) {
+    console.error("Affinity history fetch failed:", err);
+  }
+
+  // Post an immediate placeholder so the user sees progress; we edit it in place
+  // with the final answer (or error). Long writes then aren't dead air.
+  let placeholderTs: string | null = null;
+  try {
+    placeholderTs = await postSlackMessage(channel, "_Working through Affinity…_", replyTo);
+  } catch {}
 
   try {
-    const history = await getThreadMessages(channel, threadTs, botId);
     const fallback = [
-      { role: "user" as const, content: text.trim().replace(/^\$aff\b/i, "").trim() },
+      { role: "user" as const, content: trimmed.replace(/^\$aff\b/i, "").trim() },
     ];
     const answer = await askAffinity(history.length > 0 ? history : fallback);
-    await postSlackMessage(channel, answer, threadTs);
+    if (placeholderTs) await updateSlackMessage(channel, placeholderTs, answer);
+    else await postSlackMessage(channel, answer, replyTo);
   } catch (err) {
     console.error("Affinity handler failed:", err);
+    const reason = err instanceof Error ? err.message : String(err);
+    const msg = `Sorry — I hit an error querying Affinity.\n\`${reason.slice(0, 300)}\``;
     try {
-      await postSlackMessage(channel, "Sorry — I hit an error querying Affinity.", threadTs);
+      if (placeholderTs) await updateSlackMessage(channel, placeholderTs, msg);
+      else await postSlackMessage(channel, msg, replyTo);
     } catch {}
   }
   return true;
@@ -103,12 +173,12 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
     } else if (cmd === "help" || cmd === "") {
       await postSlackMessage(event.channel, HELP_REPLY);
     } else {
+      if (await tryAffinityLatest(event.channel, text, event.thread_ts ?? event.ts)) return;
       let botId = "";
       try {
         botId = await getBotUserId();
       } catch {}
-      const threadTs = event.thread_ts ?? event.ts;
-      if (botId && threadTs && (await tryAffinity(event.channel, text, threadTs, botId))) return;
+      if (botId && (await tryAffinity(event.channel, text, botId, event.thread_ts ?? event.ts, event.thread_ts))) return;
       const answer = await answerQuestion(text);
       await postSlackMessage(event.channel, answer);
     }
@@ -136,7 +206,8 @@ async function handleChannelMention(event: SlackEvent): Promise<void> {
   const threadTs = event.thread_ts ?? event.ts;
 
   try {
-    if (threadTs && (await tryAffinity(event.channel, question, threadTs, botId))) return;
+    if (await tryAffinityLatest(event.channel, question, event.thread_ts ?? event.ts)) return;
+    if (await tryAffinity(event.channel, question, botId, event.thread_ts ?? event.ts, event.thread_ts)) return;
     const answer = await answerQuestion(question);
     await postSlackMessage(event.channel, answer, threadTs);
   } catch (err) {
@@ -202,8 +273,8 @@ async function handleGroupMessage(event: SlackEvent): Promise<void> {
     }
     if (mentioned) {
       // A question directed at the bot (doesn't change summary subscription).
-      const threadTs = event.thread_ts ?? event.ts;
-      if (threadTs && (await tryAffinity(channel, stripped, threadTs, botId))) return;
+      if (await tryAffinityLatest(channel, stripped, event.thread_ts ?? event.ts)) return;
+      if (await tryAffinity(channel, stripped, botId, event.thread_ts ?? event.ts, event.thread_ts)) return;
       const answer = await answerQuestion(stripped);
       await postSlackMessage(channel, answer);
       return;

@@ -219,6 +219,11 @@ export async function POST(req: NextRequest) {
 
     // Auto-ingest into the research library (best-effort — never block or fail
     // the summary fan-out). Prefer the full article when we have its URL.
+    // Canonical /research articles get dated from the index inside ingestArticle;
+    // newsletter editions (Beehiiv tracking links / no URL) are "published" on
+    // send, so we date them with today's date.
+    const sendDate = new Date().toISOString().slice(0, 10);
+    const isResearchUrl = !!articleUrl && /activantcapital\.com\/research\//i.test(articleUrl);
     try {
       if (articleUrl) {
         let toIngest;
@@ -227,9 +232,10 @@ export async function POST(req: NextRequest) {
         } catch {
           toIngest = { title: subject, url: articleUrl, text: body };
         }
+        if (!toIngest.publishedAt && !isResearchUrl) toIngest.publishedAt = sendDate;
         await ingestArticle(toIngest);
       } else {
-        await ingestArticle({ title: subject, text: body });
+        await ingestArticle({ title: subject, text: body, publishedAt: sendDate });
       }
     } catch (err) {
       console.error("Auto-ingest of newsletter failed:", err);

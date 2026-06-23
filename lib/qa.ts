@@ -1,18 +1,19 @@
-import { retrieve, listArticleIndex, RetrievedChunk } from "@/lib/retrieval";
+import { retrieve, listArticleIndex, getArticleChunks, RetrievedChunk } from "@/lib/retrieval";
 
 const QA_SYSTEM_PROMPT =
-  "You are ARIA, a research assistant for Activant Capital. Answer content questions using ONLY the provided research excerpts; if they don't contain the answer, say you don't have that in the research rather than guessing. You are also given an index of EVERY research article with its publication date, sorted newest first — use the index (not the excerpts) to answer questions about recency, dates, counts, or which articles exist (e.g. 'what's the latest article', 'how many did we publish in 2025'). Article dates are month-level precision. Be concise and write for a Slack message. Attribute key facts to the article they came from. Use Slack formatting: single asterisks for *bold*, never double asterisks, and no markdown headers.";
+  "You are ARIA, a research assistant for Activant Capital. Answer content questions using ONLY the provided research excerpts; if they don't contain the answer, say you don't have that in the research rather than guessing. You are also given an index of EVERY research article with its publication date, sorted newest first — use the index (not the excerpts) to answer questions about recency, dates, counts, or which articles exist (e.g. 'what's the latest article', 'how many did we publish in 2025'). Article dates are day-level and the index is already ordered newest first, so for 'latest'/'most recent' name the single article at the top — never say two articles are tied or that you can't tell which is newer; if two dates differ at all, the later date is more recent. Be concise and write for a Slack message. Attribute key facts to the article they came from. Use Slack formatting: single asterisks for *bold*, never double asterisks, and no markdown headers.";
 
 const MONTH_NAMES = [
   "", "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
 
-function formatMonth(d: string | null): string {
+function formatDate(d: string | null): string {
   if (!d) return "date unknown";
-  const [y, m] = d.split("-");
+  const [y, m, day] = d.split("-");
   const idx = Number(m);
-  return idx >= 1 && idx <= 12 ? `${MONTH_NAMES[idx]} ${y}` : y;
+  if (!(idx >= 1 && idx <= 12)) return y;
+  return day ? `${MONTH_NAMES[idx]} ${Number(day)}, ${y}` : `${MONTH_NAMES[idx]} ${y}`;
 }
 
 /** Answer a question grounded in the research library. Returns Slack-ready text. */
@@ -40,14 +41,33 @@ export async function answerQuestion(question: string): Promise<string> {
     return "I couldn't find anything in the research library for that.";
   }
 
+  // "What's the latest article?" style questions: semantic search on the
+  // question won't surface the newest article's text, so pull it explicitly
+  // by URL from the top of the dated index and put it first in the context.
+  const recencyAbout =
+    /\b(latest|most recent|newest|recent)\b/i.test(q) &&
+    /\b(article|research|piece|report|writ|publish|news)\b/i.test(q);
+  let chunksForAnswer = chunks;
+  if (recencyAbout && index.length) {
+    try {
+      const latest = await getArticleChunks(index[0], 6);
+      if (latest.length) {
+        const seen = new Set(latest.map((c) => c.content));
+        chunksForAnswer = [...latest, ...chunks.filter((c) => !seen.has(c.content))];
+      }
+    } catch (e) {
+      console.error("Latest-article fetch failed:", e);
+    }
+  }
+
   const indexText = index
     .map(
       (a) =>
-        `- ${a.article_title} — ${formatMonth(a.published_at)}${a.article_url ? ` (${a.article_url})` : ""}`
+        `- ${a.article_title} — ${formatDate(a.published_at)}${a.article_url ? ` (${a.article_url})` : ""}`
     )
     .join("\n");
 
-  const context = chunks
+  const context = chunksForAnswer
     .map(
       (c, i) =>
         `[[${i + 1}]] ${c.article_title}${c.article_url ? ` (${c.article_url})` : ""}\n${c.content}`
@@ -94,7 +114,7 @@ export async function answerQuestion(question: string): Promise<string> {
   // Append up to 3 distinct source links from the excerpts used.
   const sources = [
     ...new Map(
-      chunks.filter((c) => c.article_url).map((c) => [c.article_url, c])
+      chunksForAnswer.filter((c) => c.article_url).map((c) => [c.article_url, c])
     ).values(),
   ].slice(0, 3);
 

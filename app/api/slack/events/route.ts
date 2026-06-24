@@ -1,17 +1,23 @@
 import { NextRequest } from "next/server";
 import { waitUntil } from "@vercel/functions";
 import { getSupabase } from "@/lib/supabase";
-import { postSlackMessage, updateSlackMessage, getBotUserId, getRecentMessages, getThreadMessages, getThreadRootText, verifySlackSignature } from "@/lib/slack";
+import { postSlackMessage, updateSlackMessage, getBotUserId, verifySlackSignature } from "@/lib/slack";
 import { answerQuestion, researchJoke } from "@/lib/qa";
-import { askAffinity, latestReachouts } from "@/lib/affinity";
+import { logEvent } from "@/lib/metrics";
+import {
+  isReservedName,
+  defineCommand,
+  deleteCommand,
+  getCommand,
+  listCommands,
+  runCustomCommand,
+} from "@/lib/commands";
 
 // node crypto (signature verification) requires the Node.js runtime.
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Raised so multi-step Affinity writes can finish. NOTE: cap by your Vercel
-// plan — Hobby max is 60, Pro allows up to 300. If a deploy fails on this line,
-// lower it to your plan's limit (and lower AFFINITY_TIMEOUT_MS to match).
-export const maxDuration = 300;
+// Research Q&A and custom commands finish quickly; 60s is plenty.
+export const maxDuration = 60;
 
 const SUBSCRIBE_REPLY =
   "✅ You're subscribed! You'll receive a DM summary every time a new Activant Capital research newsletter arrives.";
@@ -50,110 +56,136 @@ function stripMention(text: string, botId: string): string {
   return (text || "").replace(new RegExp(`<@${botId}>`, "g"), "").trim();
 }
 
+// User-defined commands + their management verbs ($def / $undef / $commands).
+// Built-ins ($joke) are reserved and fall through to their own handler. Custom
+// commands are prompt macros — text in, text out, no code.
+async function tryUserCommands(
+  channel: string,
+  text: string,
+  userId: string,
+  replyTo?: string
+): Promise<boolean> {
+  const m = text.trim().match(/^\$([a-zA-Z][a-zA-Z0-9_]*)\b\s*([\s\S]*)$/);
+  if (!m) return false;
+  const name = m[1].toLowerCase();
+  const args = (m[2] || "").trim();
+  const say = async (msg: string) => {
+    try {
+      await postSlackMessage(channel, msg, replyTo);
+    } catch {}
+  };
+
+  // --- management verbs ---
+  if (name === "def") {
+    const dm = args.match(/^([a-zA-Z][a-zA-Z0-9_]*)\s+([\s\S]+)$/);
+    if (!dm) {
+      await say("Usage: `$def <name> <prompt>` — put `{input}` where the caller's text should go (e.g. `$def tldr Summarize in 3 bullets: {input}`).");
+      return true;
+    }
+    const cname = dm[1].toLowerCase();
+    if (isReservedName(cname)) {
+      await say(`\`$${cname}\` is reserved and can't be redefined.`);
+      return true;
+    }
+    try {
+      await defineCommand(cname, dm[2].trim(), userId);
+      await say(`Saved \`$${cname}\`. Use it like \`$${cname} <your input>\`; remove it with \`$undef ${cname}\`.`);
+    } catch (e) {
+      await say(`Couldn't save that command: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return true;
+  }
+  if (name === "undef" || name === "delete" || name === "remove") {
+    const cname = args.split(/\s+/)[0]?.toLowerCase();
+    if (!cname) {
+      await say("Usage: `$undef <name>`");
+      return true;
+    }
+    if (isReservedName(cname)) {
+      await say(`\`$${cname}\` is built-in and can't be removed.`);
+      return true;
+    }
+    try {
+      await deleteCommand(cname);
+      await say(`Removed \`$${cname}\`.`);
+    } catch (e) {
+      await say(`Couldn't remove that: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return true;
+  }
+  if (name === "commands" || name === "list") {
+    try {
+      const cmds = await listCommands();
+      if (!cmds.length) await say("No custom commands yet. Create one with `$def <name> <prompt>`.");
+      else await say("*Custom commands:*\n" + cmds.map((c) => `• \`$${c.name}\``).join("\n"));
+    } catch (e) {
+      await say(`Couldn't list commands: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return true;
+  }
+
+  if (name === "all" || name === "help") {
+    let custom: string[] = [];
+    try {
+      custom = (await listCommands()).map((c) => `\`$${c.name}\``);
+    } catch {}
+    const lines = [
+      "*ARIA commands:*",
+      "• `$joke` — a one-liner riffing on the research library.",
+      "• `$def <name> <prompt>` — make your own command (use `{input}` where the caller's text goes). `$undef <name>` removes it.",
+      "• `$commands` — list custom commands. `$all` — show this list.",
+      "• Or just ask a question with no prefix and I'll search the research library (e.g. \"what's the latest research?\").",
+    ];
+    if (custom.length) lines.push("*Custom commands:* " + custom.join(", "));
+    await say(lines.join("\n"));
+    return true;
+  }
+
+  // Built-ins handle themselves.
+  if (isReservedName(name)) return false;
+
+  // --- custom command lookup ---
+  let cmd = null;
+  try {
+    cmd = await getCommand(name);
+  } catch {}
+  if (!cmd) {
+    await say(`No \`$${name}\` command yet. See \`$commands\`, or create it with \`$def ${name} <prompt>\`.`);
+    return true;
+  }
+
+  let placeholderTs: string | null = null;
+  try {
+    placeholderTs = await postSlackMessage(channel, `_Running \`$${name}\`…_`, replyTo);
+  } catch {}
+  try {
+    const out = await runCustomCommand(cmd, args);
+    if (placeholderTs) await updateSlackMessage(channel, placeholderTs, out);
+    else await say(out);
+    void logEvent("ARIA", "custom_command", { userId, metadata: { name } });
+  } catch (e) {
+    console.error("Custom command failed:", e);
+    const msg = `Sorry — \`$${name}\` failed.\n\`${(e instanceof Error ? e.message : String(e)).slice(0, 200)}\``;
+    if (placeholderTs) {
+      try {
+        await updateSlackMessage(channel, placeholderTs, msg);
+      } catch {}
+    } else await say(msg);
+  }
+  return true;
+}
+
 // $joke: a one-line joke riffing on the research embedding library. Returns true if handled.
 async function tryJoke(channel: string, text: string, replyTo?: string): Promise<boolean> {
   if (!/^\$joke\b/i.test(text.trim())) return false;
   try {
     const joke = await researchJoke();
     await postSlackMessage(channel, joke, replyTo);
+    void logEvent("ARIA", "joke");
   } catch (err) {
     console.error("Joke handler failed:", err);
     try {
       await postSlackMessage(channel, "Sorry — couldn't come up with one right now.", replyTo);
-    } catch {}
-  }
-  return true;
-}
-
-// $afflat: a batch reach-out report for a list of companies (comma- or
-// newline-separated). One-shot — no thread continuation. Returns true if handled.
-async function tryAffinityLatest(
-  channel: string,
-  text: string,
-  replyTo?: string
-): Promise<boolean> {
-  if (!/^\$afflat\b/i.test(text.trim())) return false;
-
-  let placeholderTs: string | null = null;
-  try {
-    placeholderTs = await postSlackMessage(channel, "_Pulling latest reach-out data from Affinity…_", replyTo);
-  } catch {}
-
-  try {
-    const answer = await latestReachouts(text);
-    if (placeholderTs) await updateSlackMessage(channel, placeholderTs, answer);
-    else await postSlackMessage(channel, answer, replyTo);
-  } catch (err) {
-    console.error("Affinity latest handler failed:", err);
-    const reason = err instanceof Error ? err.message : String(err);
-    const msg = `Sorry — I hit an error building the reach-out report.\n\`${reason.slice(0, 300)}\``;
-    try {
-      if (placeholderTs) await updateSlackMessage(channel, placeholderTs, msg);
-      else await postSlackMessage(channel, msg, replyTo);
-    } catch {}
-  }
-  return true;
-}
-
-// Route to the Affinity CRM handler when the message either (a) starts with
-// $aff, or (b) is a reply inside a thread that was started with $aff — so you
-// don't have to repeat the prefix to keep talking to Affinity in that thread.
-// Replies post into the thread rooted at the triggering message (replyTo), and
-// multi-turn context is that thread's history. Returns true if handled.
-async function tryAffinity(
-  channel: string,
-  text: string,
-  botId: string,
-  replyTo?: string,
-  threadTs?: string
-): Promise<boolean> {
-  const trimmed = text.trim();
-  const isExplicit = /^\$aff\b/i.test(trimmed);
-
-  // No prefix, but in a thread? Continue Affinity mode if the thread's root
-  // message was a $aff command.
-  let inAffinityThread = false;
-  if (!isExplicit && threadTs) {
-    try {
-      const root = await getThreadRootText(channel, threadTs);
-      inAffinityThread = /^\$aff\b/i.test(root.replace(/<@\w+>/g, "").trim());
-    } catch (err) {
-      console.error("Affinity thread check failed:", err);
-    }
-  }
-  if (!isExplicit && !inAffinityThread) return false;
-
-  // Gather context BEFORE posting the placeholder, so it isn't fed back as input.
-  let history: { role: "user" | "assistant"; content: string }[] = [];
-  try {
-    history = replyTo
-      ? await getThreadMessages(channel, replyTo, botId)
-      : await getRecentMessages(channel, botId, 12);
-  } catch (err) {
-    console.error("Affinity history fetch failed:", err);
-  }
-
-  // Post an immediate placeholder so the user sees progress; we edit it in place
-  // with the final answer (or error). Long writes then aren't dead air.
-  let placeholderTs: string | null = null;
-  try {
-    placeholderTs = await postSlackMessage(channel, "_Working through Affinity…_", replyTo);
-  } catch {}
-
-  try {
-    const fallback = [
-      { role: "user" as const, content: trimmed.replace(/^\$aff\b/i, "").trim() },
-    ];
-    const answer = await askAffinity(history.length > 0 ? history : fallback);
-    if (placeholderTs) await updateSlackMessage(channel, placeholderTs, answer);
-    else await postSlackMessage(channel, answer, replyTo);
-  } catch (err) {
-    console.error("Affinity handler failed:", err);
-    const reason = err instanceof Error ? err.message : String(err);
-    const msg = `Sorry — I hit an error querying Affinity.\n\`${reason.slice(0, 300)}\``;
-    try {
-      if (placeholderTs) await updateSlackMessage(channel, placeholderTs, msg);
-      else await postSlackMessage(channel, msg, replyTo);
     } catch {}
   }
   return true;
@@ -178,6 +210,7 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
         );
       if (error) throw error;
       await postSlackMessage(event.channel, SUBSCRIBE_REPLY);
+      void logEvent("ARIA", "subscribe", { userId: event.user });
     } else if (cmd === "unsubscribe") {
       const { error } = await supabase
         .from("subscribers")
@@ -185,18 +218,15 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
         .eq("slack_user_id", event.user);
       if (error) throw error;
       await postSlackMessage(event.channel, UNSUBSCRIBE_REPLY);
+      void logEvent("ARIA", "unsubscribe", { userId: event.user });
     } else if (cmd === "help" || cmd === "") {
       await postSlackMessage(event.channel, HELP_REPLY);
     } else {
+      if (await tryUserCommands(event.channel, text, event.user, event.thread_ts ?? event.ts)) return;
       if (await tryJoke(event.channel, text, event.thread_ts ?? event.ts)) return;
-      if (await tryAffinityLatest(event.channel, text, event.thread_ts ?? event.ts)) return;
-      let botId = "";
-      try {
-        botId = await getBotUserId();
-      } catch {}
-      if (botId && (await tryAffinity(event.channel, text, botId, event.thread_ts ?? event.ts, event.thread_ts))) return;
       const answer = await answerQuestion(text);
       await postSlackMessage(event.channel, answer);
+      void logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "dm" } });
     }
   } catch (err) {
     console.error("Failed to handle Slack DM:", err);
@@ -222,11 +252,11 @@ async function handleChannelMention(event: SlackEvent): Promise<void> {
   const threadTs = event.thread_ts ?? event.ts;
 
   try {
+    if (await tryUserCommands(event.channel, question, event.user, event.thread_ts ?? event.ts)) return;
     if (await tryJoke(event.channel, question, event.thread_ts ?? event.ts)) return;
-    if (await tryAffinityLatest(event.channel, question, event.thread_ts ?? event.ts)) return;
-    if (await tryAffinity(event.channel, question, botId, event.thread_ts ?? event.ts, event.thread_ts)) return;
     const answer = await answerQuestion(question);
     await postSlackMessage(event.channel, answer, threadTs);
+    void logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "channel" } });
   } catch (err) {
     console.error("Failed to answer channel mention:", err);
     try {
@@ -290,11 +320,11 @@ async function handleGroupMessage(event: SlackEvent): Promise<void> {
     }
     if (mentioned) {
       // A question directed at the bot (doesn't change summary subscription).
+      if (await tryUserCommands(channel, stripped, event.user, event.thread_ts ?? event.ts)) return;
       if (await tryJoke(channel, stripped, event.thread_ts ?? event.ts)) return;
-      if (await tryAffinityLatest(channel, stripped, event.thread_ts ?? event.ts)) return;
-      if (await tryAffinity(channel, stripped, botId, event.thread_ts ?? event.ts, event.thread_ts)) return;
       const answer = await answerQuestion(stripped);
       await postSlackMessage(channel, answer);
+      void logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "group" } });
       return;
     }
 

@@ -258,10 +258,11 @@ allowance still applies, so you won't be charged at this volume.
   start/stop command is treated as a question.)
 - **`@ARIA $aff <query>`** → CRM mode: instead of the research library, ARIA
   queries Activant's Affinity pipeline/contacts/orgs/deals (via the Affinity MCP
-  server) and replies in-thread. Follow-ups in the same thread keep context, so
-  you can ask "and which of those closed?" without repeating yourself. In a
-  direct message you can drop the mention and just send `$aff <query>` — the `$`
-  prefix is used (not `/`) so Slack doesn't intercept it as a slash command.
+  server) and replies in the channel. It uses the recent ARIA conversation for
+  context, so follow-ups like "and which of those closed?" work without
+  repeating yourself. In a direct message you can drop the mention and just send
+  `$aff <query>` — the `$` prefix is used (not `/`) so Slack doesn't intercept it
+  as a slash command.
 - **Add the bot to a channel** (e.g. `/invite @ARIA`) → it registers that
   channel and posts every future summary there too. Remove it from the channel
   to stop. Private channels work if you invite the bot directly.

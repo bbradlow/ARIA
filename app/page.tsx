@@ -5,6 +5,9 @@ export default function Home() {
       <p>This is a background service — there is no user-facing UI.</p>
       <ul>
         <li>
+          Metrics dashboard: <code>/dashboard?token=METRICS_TOKEN</code>
+        </li>
+        <li>
           Inbound email webhook: <code>/api/email/inbound</code>
         </li>
         <li>

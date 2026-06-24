@@ -20,6 +20,28 @@ export async function retrieve(question: string, matchCount = 6): Promise<Retrie
   return (data ?? []) as RetrievedChunk[];
 }
 
+/** Fetch stored chunks for one specific article (by URL, or title as fallback). */
+export async function getArticleChunks(
+  article: { article_url: string | null; article_title: string },
+  limit = 6
+): Promise<RetrievedChunk[]> {
+  const supabase = getSupabase();
+  let query = supabase
+    .from("research_chunks")
+    .select("content, article_title, article_url");
+  query = article.article_url
+    ? query.eq("article_url", article.article_url)
+    : query.eq("article_title", article.article_title);
+  const { data, error } = await query.limit(limit);
+  if (error) throw error;
+  return ((data ?? []) as any[]).map((r) => ({
+    content: r.content,
+    article_title: r.article_title,
+    article_url: r.article_url,
+    similarity: 1,
+  }));
+}
+
 export interface ArticleMeta {
   article_title: string;
   article_url: string | null;

@@ -1,9 +1,10 @@
 import { getSupabase } from "@/lib/supabase";
 
 /**
- * Fire-and-forget event logging into the shared `bot_events` table. Every bot
- * (ARIA, APRIL, ARC) writes here tagged with its name; the dashboard reads and
- * aggregates across all three. Never throws — metrics must not break the bot.
+ * Event logging into the shared `bot_events` table. Every bot (ARIA, APRIL,
+ * ARC) writes here tagged with its name; the dashboard reads and aggregates
+ * across all three. Never throws — metrics must not break the bot. Callers
+ * should `await` this so the write completes before the function freezes.
  *
  * Table (run once in Supabase):
  *   create table if not exists bot_events (
@@ -24,12 +25,13 @@ export async function logEvent(
 ): Promise<void> {
   try {
     const supabase = getSupabase();
-    await supabase.from("bot_events").insert({
+    const { error } = await supabase.from("bot_events").insert({
       bot,
       event_type: eventType,
       user_id: opts?.userId ?? null,
       metadata: opts?.metadata ?? null,
     });
+    if (error) console.error("logEvent insert error:", error.message);
   } catch (err) {
     console.error("logEvent failed:", err);
   }

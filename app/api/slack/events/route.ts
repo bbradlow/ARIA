@@ -162,7 +162,7 @@ async function tryUserCommands(
     const out = await runCustomCommand(cmd, args);
     if (placeholderTs) await updateSlackMessage(channel, placeholderTs, out);
     else await say(out);
-    void logEvent("ARIA", "custom_command", { userId, metadata: { name } });
+    await logEvent("ARIA", "custom_command", { userId, metadata: { name } });
   } catch (e) {
     console.error("Custom command failed:", e);
     const msg = `Sorry — \`$${name}\` failed.\n\`${(e instanceof Error ? e.message : String(e)).slice(0, 200)}\``;
@@ -181,7 +181,7 @@ async function tryJoke(channel: string, text: string, replyTo?: string): Promise
   try {
     const joke = await researchJoke();
     await postSlackMessage(channel, joke, replyTo);
-    void logEvent("ARIA", "joke");
+    await logEvent("ARIA", "joke");
   } catch (err) {
     console.error("Joke handler failed:", err);
     try {
@@ -210,7 +210,7 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
         );
       if (error) throw error;
       await postSlackMessage(event.channel, SUBSCRIBE_REPLY);
-      void logEvent("ARIA", "subscribe", { userId: event.user });
+      await logEvent("ARIA", "subscribe", { userId: event.user });
     } else if (cmd === "unsubscribe") {
       const { error } = await supabase
         .from("subscribers")
@@ -218,7 +218,7 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
         .eq("slack_user_id", event.user);
       if (error) throw error;
       await postSlackMessage(event.channel, UNSUBSCRIBE_REPLY);
-      void logEvent("ARIA", "unsubscribe", { userId: event.user });
+      await logEvent("ARIA", "unsubscribe", { userId: event.user });
     } else if (cmd === "help" || cmd === "") {
       await postSlackMessage(event.channel, HELP_REPLY);
     } else {
@@ -226,7 +226,7 @@ async function handleDirectMessage(event: SlackEvent): Promise<void> {
       if (await tryJoke(event.channel, text, event.thread_ts ?? event.ts)) return;
       const answer = await answerQuestion(text);
       await postSlackMessage(event.channel, answer);
-      void logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "dm" } });
+      await logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "dm" } });
     }
   } catch (err) {
     console.error("Failed to handle Slack DM:", err);
@@ -256,7 +256,7 @@ async function handleChannelMention(event: SlackEvent): Promise<void> {
     if (await tryJoke(event.channel, question, event.thread_ts ?? event.ts)) return;
     const answer = await answerQuestion(question);
     await postSlackMessage(event.channel, answer, threadTs);
-    void logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "channel" } });
+    await logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "channel" } });
   } catch (err) {
     console.error("Failed to answer channel mention:", err);
     try {
@@ -324,7 +324,7 @@ async function handleGroupMessage(event: SlackEvent): Promise<void> {
       if (await tryJoke(channel, stripped, event.thread_ts ?? event.ts)) return;
       const answer = await answerQuestion(stripped);
       await postSlackMessage(channel, answer);
-      void logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "group" } });
+      await logEvent("ARIA", "research_query", { userId: event.user, metadata: { surface: "group" } });
       return;
     }
 

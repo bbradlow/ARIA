@@ -62,10 +62,29 @@ async function distinctArticleCount(supabase: ReturnType<typeof getSupabase>): P
   }
 }
 
-export async function GET(req: NextRequest) {
+// Authorized if EITHER a valid Supabase session (Authorization: Bearer <jwt>)
+// OR the metrics token (?token=) is provided. The token is a fallback so the
+// dashboard is never locked out if auth is misconfigured.
+async function isAuthorized(req: NextRequest): Promise<boolean> {
   const token = req.nextUrl.searchParams.get("token");
   const expected = process.env.METRICS_TOKEN || process.env.INGEST_TOKEN;
-  if (!expected || token !== expected) {
+  if (expected && token === expected) return true;
+
+  const auth = req.headers.get("authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (m) {
+    try {
+      const { data, error } = await getSupabase().auth.getUser(m[1]);
+      if (!error && data?.user) return true;
+    } catch {
+      // fall through to unauthorized
+    }
+  }
+  return false;
+}
+
+export async function GET(req: NextRequest) {
+  if (!(await isAuthorized(req))) {
     return NextResponse.json(
       { error: "unauthorized" },
       { status: 401, headers: { "Cache-Control": "no-store" } }

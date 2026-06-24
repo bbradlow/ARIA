@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 type Point = { date: string; count: number };
 type TypeCount = { type: string; count: number };
@@ -180,7 +180,7 @@ export default function Dashboard() {
   );
 }
 
-function Shell({ children }: { children: React.ReactNode }) {
+function Shell({ children }: { children: ReactNode }) {
   return (
     <div style={{ minHeight: "100vh", background: BG, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
       <div style={{ maxWidth: 1040, margin: "0 auto", padding: "32px 24px 64px" }}>{children}</div>
@@ -188,7 +188,7 @@ function Shell({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
+function Card({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: 18 }}>
       <div style={{ fontSize: 13, fontWeight: 600, color: INK, marginBottom: 14 }}>{title}</div>

@@ -62,7 +62,7 @@ function stripMention(text: string, botId: string): string {
 async function tryUserCommands(
   channel: string,
   text: string,
-  userId: string,
+  userId: string | undefined,
   replyTo?: string
 ): Promise<boolean> {
   const m = text.trim().match(/^\$([a-zA-Z][a-zA-Z0-9_]*)\b\s*([\s\S]*)$/);
@@ -88,7 +88,7 @@ async function tryUserCommands(
       return true;
     }
     try {
-      await defineCommand(cname, dm[2].trim(), userId);
+      await defineCommand(cname, dm[2].trim(), userId ?? "unknown");
       await say(`Saved \`$${cname}\`. Use it like \`$${cname} <your input>\`; remove it with \`$undef ${cname}\`.`);
     } catch (e) {
       await say(`Couldn't save that command: ${e instanceof Error ? e.message : String(e)}`);

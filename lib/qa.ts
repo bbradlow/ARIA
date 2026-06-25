@@ -1,5 +1,6 @@
 import { retrieve, listArticleIndex, getArticleChunks, RetrievedChunk } from "@/lib/retrieval";
 import { logLlmUsage } from "@/lib/metrics";
+import { getActiveModel } from "@/lib/model-config";
 
 const QA_SYSTEM_PROMPT =
   "You are ARIA, a research assistant for Activant Capital. Answer content questions using ONLY the provided research excerpts; if they don't contain the answer, say you don't have that in the research rather than guessing. You are also given an index of EVERY research article with its publication date, sorted newest first — use the index (not the excerpts) to answer questions about recency, dates, counts, or which articles exist (e.g. 'what's the latest article', 'how many did we publish in 2025'). Article dates are day-level and the index is already ordered newest first, so for 'latest'/'most recent' name the single article at the top — never say two articles are tied or that you can't tell which is newer; if two dates differ at all, the later date is more recent. Be concise and write for a Slack message. Attribute key facts to the article they came from. Use Slack formatting: single asterisks for *bold*, never double asterisks, and no markdown headers.";
@@ -77,7 +78,7 @@ export async function answerQuestion(question: string): Promise<string> {
 
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error("Missing OPENROUTER_API_KEY environment variable");
-  const model = process.env.QA_MODEL?.trim() || "anthropic/claude-sonnet-4-5";
+  const model = await getActiveModel("ARIA", process.env.QA_MODEL);
 
   const userContent =
     `Article index (all research, newest first):\n${indexText || "(none)"}\n\n` +
@@ -144,7 +145,7 @@ export async function researchJoke(): Promise<string> {
 
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error("Missing OPENROUTER_API_KEY environment variable");
-  const model = process.env.QA_MODEL?.trim() || "anthropic/claude-sonnet-4-5";
+  const model = await getActiveModel("ARIA", process.env.QA_MODEL);
 
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",

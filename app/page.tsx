@@ -18,6 +18,10 @@ type BotData = {
 type Metrics = { generatedAt: string; windowDays: number; bots: Record<string, BotData> };
 
 const TABS = ["ARIA", "APRIL", "ARC"] as const;
+
+// ── Edit this to change the heading shown at the top of the dashboard ──
+const DASHBOARD_TITLE = "Bot Metrics";
+
 const ACCENT = "#2f6feb";
 const INK = "#0f1222";
 const MUTE = "#6b7280";
@@ -110,7 +114,7 @@ export default function Dashboard() {
     return (
       <Shell>
         <div style={{ maxWidth: 380, margin: "12vh auto 0", textAlign: "center" }}>
-          <h1 style={{ fontSize: 22, color: INK, marginBottom: 6 }}>Bot Metrics</h1>
+          <h1 style={{ fontSize: 22, color: INK, marginBottom: 6 }}>{DASHBOARD_TITLE}</h1>
           <p style={{ color: MUTE, marginBottom: 22, fontSize: 13 }}>Sign in to view the dashboard.</p>
           <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: 22, textAlign: "left" }}>
             {supabase ? (
@@ -149,7 +153,7 @@ export default function Dashboard() {
     <Shell>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
         <div>
-          <h1 style={{ fontSize: 22, color: INK, margin: 0 }}>Bot Metrics</h1>
+          <h1 style={{ fontSize: 22, color: INK, margin: 0 }}>{DASHBOARD_TITLE}</h1>
           <p style={{ color: MUTE, margin: "4px 0 0", fontSize: 13 }}>
             {data ? `Last ${data.windowDays} days · updated ${new Date(data.generatedAt).toLocaleString()}` : "Loading…"}
           </p>
@@ -205,6 +209,8 @@ export default function Dashboard() {
               <div style={{ fontSize: 14, color: INK, fontWeight: 600, marginTop: 4, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{bot.model}</div>
             </div>
           </div>
+
+          <ModelControl bot={bot.name} token={token} session={session} displayedModel={bot.model} />
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
             {bot.headline.map((h) => (
@@ -283,6 +289,97 @@ function TypeBreakdown({ rows }: { rows: TypeCount[] }) {
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function ModelControl({
+  bot,
+  token,
+  session,
+  displayedModel,
+}: {
+  bot: string;
+  token: string;
+  session: Session | null;
+  displayedModel: string;
+}) {
+  const [value, setValue] = useState("");
+  const [status, setStatus] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  function authFetch(url: string, opts: RequestInit = {}) {
+    const headers: Record<string, string> = { ...(opts.headers as Record<string, string>) };
+    let u = url;
+    if (token) u += (u.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token);
+    else if (session) headers["Authorization"] = `Bearer ${session.access_token}`;
+    return fetch(u, { ...opts, headers, cache: "no-store" });
+  }
+
+  useEffect(() => {
+    authFetch("/api/model-config")
+      .then((r) => r.json())
+      .then((d) => {
+        setValue((d.overrides && d.overrides[bot]) || "");
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bot]);
+
+  async function save() {
+    setStatus("Saving…");
+    try {
+      const r = await authFetch("/api/model-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot, model: value.trim() }),
+      });
+      if (!r.ok) throw new Error();
+      setStatus("Saved ✓ — applies on the next query");
+      setTimeout(() => setStatus(null), 3000);
+    } catch {
+      setStatus("Save failed");
+    }
+  }
+
+  const COMMON = [
+    "anthropic/claude-sonnet-4-5",
+    "anthropic/claude-haiku-4-5",
+    "anthropic/claude-opus-4",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "openai/gpt-4.1",
+    "google/gemini-2.5-pro",
+    "google/gemini-2.5-flash",
+  ];
+
+  return (
+    <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: 18, marginBottom: 12 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: INK, marginBottom: 4 }}>Model</div>
+      <div style={{ fontSize: 12, color: MUTE, marginBottom: 10 }}>
+        Override {bot}&rsquo;s model. Leave blank to use the environment default. Currently in use: <code>{displayedModel}</code>
+      </div>
+      {!loaded ? (
+        <div style={{ color: MUTE, fontSize: 13 }}>Loading…</div>
+      ) : (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            list={`models-${bot}`}
+            style={{ ...inpStyle, width: 320, marginTop: 0 }}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder={displayedModel}
+          />
+          <datalist id={`models-${bot}`}>
+            {COMMON.map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
+          <button onClick={save} style={{ ...primaryBtn, width: "auto", marginTop: 0, padding: "9px 18px" }}>Save</button>
+          {status && <span style={{ fontSize: 12.5, color: status.includes("fail") ? "#b42318" : MUTE }}>{status}</span>}
+        </div>
+      )}
     </div>
   );
 }

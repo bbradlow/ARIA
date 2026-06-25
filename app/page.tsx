@@ -293,6 +293,8 @@ function TypeBreakdown({ rows }: { rows: TypeCount[] }) {
   );
 }
 
+type ModelOpt = { id: string; name: string; free: boolean; inPerM: number; outPerM: number };
+
 function ModelControl({
   bot,
   token,
@@ -307,7 +309,11 @@ function ModelControl({
   const [value, setValue] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [models, setModels] = useState<{ id: string; name: string }[]>([]);
+  const [models, setModels] = useState<ModelOpt[]>([]);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [provider, setProvider] = useState("all");
+  const [freeOnly, setFreeOnly] = useState(false);
 
   function authFetch(url: string, opts: RequestInit = {}) {
     const headers: Record<string, string> = { ...(opts.headers as Record<string, string>) };
@@ -332,13 +338,13 @@ function ModelControl({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bot]);
 
-  async function save() {
+  async function save(slug: string) {
     setStatus("Saving…");
     try {
       const r = await authFetch("/api/model-config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bot, model: value.trim() }),
+        body: JSON.stringify({ bot, model: slug.trim() }),
       });
       if (!r.ok) throw new Error();
       setStatus("Saved ✓ — applies on the next query");
@@ -348,47 +354,139 @@ function ModelControl({
     }
   }
 
-  const FALLBACK = [
+  const FALLBACK: ModelOpt[] = [
     "anthropic/claude-sonnet-4-5",
     "anthropic/claude-haiku-4-5",
     "anthropic/claude-opus-4",
     "openai/gpt-4o",
     "openai/gpt-4o-mini",
-    "openai/gpt-4.1",
     "google/gemini-2.5-pro",
-    "google/gemini-2.5-flash",
-  ];
-  const options = models.length > 0 ? models : FALLBACK.map((id) => ({ id, name: id }));
+  ].map((id) => ({ id, name: id, free: false, inPerM: 0, outPerM: 0 }));
+  const all = models.length > 0 ? models : FALLBACK;
+
+  const providers = ["all", ...Array.from(new Set(all.map((m) => m.id.split("/")[0]))).sort()];
+  const q = query.trim().toLowerCase();
+  const filtered = all.filter((m) => {
+    if (provider !== "all" && m.id.split("/")[0] !== provider) return false;
+    if (freeOnly && !m.free) return false;
+    if (q && !m.id.toLowerCase().includes(q) && !m.name.toLowerCase().includes(q)) return false;
+    return true;
+  });
+
+  const priceLabel = (m: ModelOpt) =>
+    m.free ? "Free" : `$${m.inPerM.toFixed(2)} in / $${m.outPerM.toFixed(2)} out per 1M`;
+
+  function choose(slug: string) {
+    setValue(slug);
+    setOpen(false);
+    setQuery("");
+    save(slug);
+  }
 
   return (
-    <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: 18, marginBottom: 12 }}>
+    <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: 18, marginBottom: 12, position: "relative" }}>
       <div style={{ fontSize: 13, fontWeight: 600, color: INK, marginBottom: 4 }}>Model</div>
       <div style={{ fontSize: 12, color: MUTE, marginBottom: 10 }}>
-        Override {bot}&rsquo;s model — start typing to search OpenRouter&rsquo;s full catalog. Leave blank to use the environment default. Currently in use: <code>{displayedModel}</code>
+        Override {bot}&rsquo;s model — search OpenRouter&rsquo;s full catalog, filter by provider, or show only free models. Currently in use: <code>{displayedModel}</code>
       </div>
       {!loaded ? (
         <div style={{ color: MUTE, fontSize: 13 }}>Loading…</div>
       ) : (
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <input
-            list={`models-${bot}`}
-            style={{ ...inpStyle, width: 320, marginTop: 0 }}
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            placeholder={displayedModel}
-          />
-          <datalist id={`models-${bot}`}>
-            {options.map((m) => (
-              <option key={m.id} value={m.id} label={m.name !== m.id ? m.name : undefined} />
-            ))}
-          </datalist>
-          <button onClick={save} style={{ ...primaryBtn, width: "auto", marginTop: 0, padding: "9px 18px" }}>Save</button>
-          {status && <span style={{ fontSize: 12.5, color: status.includes("fail") ? "#b42318" : MUTE }}>{status}</span>}
-        </div>
+        <>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              onClick={() => setOpen((o) => !o)}
+              style={{
+                ...inpStyle, width: 360, marginTop: 0, textAlign: "left", cursor: "pointer",
+                display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8,
+                fontFamily: value ? "ui-monospace, Menlo, monospace" : undefined,
+                color: value ? INK : MUTE,
+              }}
+            >
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {value || "Environment default"}
+              </span>
+              <span style={{ color: MUTE }}>▾</span>
+            </button>
+            {value && (
+              <button
+                onClick={() => { setValue(""); save(""); }}
+                style={{ ...inpStyle, width: "auto", marginTop: 0, cursor: "pointer", color: MUTE }}
+                title="Clear override — use the environment default"
+              >
+                Clear
+              </button>
+            )}
+            {status && <span style={{ fontSize: 12.5, color: status.includes("fail") ? "#b42318" : MUTE }}>{status}</span>}
+          </div>
+
+          {open && (
+            <>
+              <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 20 }} />
+              <div style={{
+                position: "absolute", zIndex: 21, left: 18, right: 18, marginTop: 8,
+                background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12,
+                boxShadow: "0 12px 32px rgba(15,18,34,0.16)", overflow: "hidden",
+              }}>
+                <div style={{ padding: 12, borderBottom: `1px solid ${LINE}`, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <input
+                    autoFocus
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search models…"
+                    style={{ ...inpStyle, marginTop: 0, flex: "1 1 200px" }}
+                  />
+                  <select value={provider} onChange={(e) => setProvider(e.target.value)} style={{ ...inpStyle, marginTop: 0, width: "auto", cursor: "pointer" }}>
+                    {providers.map((p) => (
+                      <option key={p} value={p}>{p === "all" ? "All providers" : p}</option>
+                    ))}
+                  </select>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: INK, cursor: "pointer", whiteSpace: "nowrap" }}>
+                    <input type="checkbox" checked={freeOnly} onChange={(e) => setFreeOnly(e.target.checked)} />
+                    Free only
+                  </label>
+                </div>
+                <div style={{ maxHeight: 280, overflowY: "auto" }}>
+                  {filtered.length === 0 ? (
+                    <div style={{ padding: 16, color: MUTE, fontSize: 13 }}>No matching models.</div>
+                  ) : (
+                    filtered.slice(0, 200).map((m) => (
+                      <div
+                        key={m.id}
+                        onClick={() => choose(m.id)}
+                        style={{
+                          padding: "9px 14px", cursor: "pointer", borderBottom: `1px solid #f0f1f4`,
+                          background: m.id === value ? "#eef3ff" : "#fff",
+                        }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "#f6f7f9")}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = m.id === value ? "#eef3ff" : "#fff")}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                          <span style={{ fontSize: 13, color: INK, fontWeight: 500 }}>{m.name}</span>
+                          {m.free && (
+                            <span style={{ fontSize: 10.5, fontWeight: 700, color: "#067647", background: "#e7f6ec", borderRadius: 6, padding: "2px 7px", textTransform: "uppercase", letterSpacing: 0.4 }}>Free</span>
+                          )}
+                        </div>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginTop: 2 }}>
+                          <span style={{ fontSize: 11.5, color: MUTE, fontFamily: "ui-monospace, Menlo, monospace" }}>{m.id}</span>
+                          {models.length > 0 && <span style={{ fontSize: 11, color: MUTE }}>{priceLabel(m)}</span>}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div style={{ padding: "8px 14px", borderTop: `1px solid ${LINE}`, fontSize: 11.5, color: MUTE }}>
+                  {filtered.length} model{filtered.length === 1 ? "" : "s"}{filtered.length > 200 ? " (showing first 200)" : ""}
+                </div>
+              </div>
+            </>
+          )}
+        </>
       )}
     </div>
   );
 }
+
 
 function ArcControls({ token, session }: { token: string; session: Session | null }) {
   const [mode, setMode] = useState("off");

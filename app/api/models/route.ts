@@ -4,7 +4,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 // Cache the catalog in memory so repeated dashboard loads don't re-hit OpenRouter.
-let cache: { at: number; models: { id: string; name: string }[] } | null = null;
+let cache: { at: number; models: { id: string; name: string; free: boolean; inPerM: number; outPerM: number }[] } | null = null;
 const TTL_MS = 10 * 60 * 1000;
 
 export async function GET() {
@@ -19,7 +19,14 @@ export async function GET() {
     if (!res.ok) throw new Error(`OpenRouter models request failed (${res.status})`);
     const data = await res.json();
     const models = ((data?.data ?? []) as any[])
-      .map((m) => ({ id: String(m?.id ?? ""), name: String(m?.name ?? m?.id ?? "") }))
+      .map((m) => {
+        const p = m?.pricing ?? {};
+        const inPerM = Number(p.prompt ?? 0) * 1e6;
+        const outPerM = Number(p.completion ?? 0) * 1e6;
+        const id = String(m?.id ?? "");
+        const free = (inPerM === 0 && outPerM === 0) || id.includes(":free");
+        return { id, name: String(m?.name ?? m?.id ?? ""), free, inPerM, outPerM };
+      })
       .filter((m) => m.id);
     cache = { at: Date.now(), models };
     return NextResponse.json({ models }, { headers: { "Cache-Control": "no-store" } });

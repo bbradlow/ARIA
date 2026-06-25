@@ -137,6 +137,21 @@ export async function GET(req: NextRequest) {
     events = [];
   }
 
+  // All-time cost: sum llm_usage cost across the full history (separate from the 30d window).
+  const costAllTime: Record<string, number> = { ARIA: 0, APRIL: 0, ARC: 0 };
+  try {
+    const { data } = await supabase
+      .from("bot_events")
+      .select("bot, metadata")
+      .eq("event_type", "llm_usage")
+      .limit(200000);
+    for (const r of (data as any[]) ?? []) {
+      if (r.bot in costAllTime) costAllTime[r.bot] += eventCost(r.metadata);
+    }
+  } catch {
+    /* leave zeros */
+  }
+
   const [subscribers, channels, articles] = await Promise.all([
     tableCount(supabase, "subscribers"),
     tableCount(supabase, "channels", (q) => q.eq("active", true)),
@@ -189,6 +204,7 @@ export async function GET(req: NextRequest) {
     deployed: true,
     model: ariaAgg.currentModel || process.env.QA_MODEL?.trim() || "anthropic/claude-sonnet-4-5",
     cost30d: ariaAgg.cost30d,
+    costAllTime: costAllTime.ARIA,
     headline: [
       { label: "Subscribed users", value: subscribers },
       { label: "Active channels", value: channels },
@@ -206,6 +222,7 @@ export async function GET(req: NextRequest) {
     deployed: aprilAgg.totalEvents > 0,
     model: aprilAgg.currentModel || "—",
     cost30d: aprilAgg.cost30d,
+    costAllTime: costAllTime.APRIL,
     headline: [
       { label: "Affinity queries (30d)", value: aprilAgg.queries30d },
       { label: "Queries today", value: aprilAgg.queriesToday },
@@ -221,6 +238,7 @@ export async function GET(req: NextRequest) {
     deployed: arcAgg.totalEvents > 0,
     model: arcAgg.currentModel || "—",
     cost30d: arcAgg.cost30d,
+    costAllTime: costAllTime.ARC,
     headline: [
       { label: "Queries (30d)", value: arcAgg.queries30d },
       { label: "Queries today", value: arcAgg.queriesToday },

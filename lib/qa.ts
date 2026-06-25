@@ -1,6 +1,6 @@
 import { retrieve, listArticleIndex, getArticleChunks, RetrievedChunk } from "@/lib/retrieval";
 import { logLlmUsage } from "@/lib/metrics";
-import { getActiveModel } from "@/lib/model-config";
+import { getActiveModel, getActivePrompt } from "@/lib/model-config";
 
 const QA_SYSTEM_PROMPT =
   "You are ARIA, a research assistant for Activant Capital. Answer content questions using ONLY the provided research excerpts; if they don't contain the answer, say you don't have that in the research rather than guessing. You are also given an index of EVERY research article with its publication date, sorted newest first — use the index (not the excerpts) to answer questions about recency, dates, counts, or which articles exist (e.g. 'what's the latest article', 'how many did we publish in 2025'). Article dates are day-level and the index is already ordered newest first, so for 'latest'/'most recent' name the single article at the top — never say two articles are tied or that you can't tell which is newer; if two dates differ at all, the later date is more recent. Be concise and write for a Slack message. Attribute key facts to the article they came from. Use Slack formatting: single asterisks for *bold*, never double asterisks, and no markdown headers.";
@@ -96,7 +96,7 @@ export async function answerQuestion(question: string): Promise<string> {
     body: JSON.stringify({
       model,
       messages: [
-        { role: "system", content: QA_SYSTEM_PROMPT },
+        { role: "system", content: await getActivePrompt("ARIA", QA_SYSTEM_PROMPT) },
         { role: "user", content: userContent },
       ],
     }),

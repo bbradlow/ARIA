@@ -9,6 +9,8 @@ type BotData = {
   name: string;
   label: string;
   deployed: boolean;
+  model: string;
+  cost30d: number;
   headline: { label: string; value: number }[];
   perDay: Point[];
   byType: TypeCount[];
@@ -189,6 +191,21 @@ export default function Dashboard() {
             )}
           </div>
 
+          {active === "ARC" && <ArcControls token={token} session={session} />}
+
+          <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: "16px 18px", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontSize: 28, fontWeight: 700, color: INK, lineHeight: 1.1 }}>
+                {bot.cost30d < 0.01 ? `$${bot.cost30d.toFixed(4)}` : `$${bot.cost30d.toFixed(2)}`}
+              </div>
+              <div style={{ fontSize: 12.5, color: MUTE, marginTop: 6 }}>Estimated model cost · last 30 days</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 11, color: MUTE, textTransform: "uppercase", letterSpacing: 0.5 }}>Model in use</div>
+              <div style={{ fontSize: 14, color: INK, fontWeight: 600, marginTop: 4, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{bot.model}</div>
+            </div>
+          </div>
+
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
             {bot.headline.map((h) => (
               <div key={h.label} style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: "16px 18px" }}>
@@ -266,6 +283,111 @@ function TypeBreakdown({ rows }: { rows: TypeCount[] }) {
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function ArcControls({ token, session }: { token: string; session: Session | null }) {
+  const [mode, setMode] = useState("off");
+  const [passphrase, setPassphrase] = useState("");
+  const [allowlist, setAllowlist] = useState("");
+  const [status, setStatus] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  function authFetch(url: string, opts: RequestInit = {}) {
+    const headers: Record<string, string> = { ...(opts.headers as Record<string, string>) };
+    let u = url;
+    if (token) u += (u.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token);
+    else if (session) headers["Authorization"] = `Bearer ${session.access_token}`;
+    return fetch(u, { ...opts, headers, cache: "no-store" });
+  }
+
+  useEffect(() => {
+    authFetch("/api/arc-config")
+      .then((r) => r.json())
+      .then((d) => {
+        const c = d.config || {};
+        setMode(c.mode || "off");
+        setPassphrase(c.passphrase || "");
+        setAllowlist((c.allowlist || []).join("\n"));
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function save() {
+    setStatus("Saving…");
+    try {
+      const r = await authFetch("/api/arc-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode,
+          passphrase,
+          allowlist: allowlist.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+        }),
+      });
+      if (!r.ok) throw new Error();
+      setStatus("Saved ✓");
+      setTimeout(() => setStatus(null), 2500);
+    } catch {
+      setStatus("Save failed");
+    }
+  }
+
+  const modes: { id: string; label: string; hint: string }[] = [
+    { id: "off", label: "Off", hint: "ARC ignores all messages (kill switch)." },
+    { id: "open", label: "Open", hint: "Anyone who messages ARC gets answers." },
+    { id: "passphrase", label: "Passphrase", hint: "Users must send the access phrase once to unlock." },
+    { id: "allowlist", label: "Allowlist", hint: "Only listed Slack ids / WhatsApp numbers are answered." },
+  ];
+  const current = modes.find((m) => m.id === mode);
+
+  return (
+    <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: 18, marginBottom: 12 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: INK, marginBottom: 12 }}>Access control</div>
+      {!loaded ? (
+        <div style={{ color: MUTE, fontSize: 13 }}>Loading…</div>
+      ) : (
+        <>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {modes.map((m) => {
+              const on = m.id === mode;
+              return (
+                <button key={m.id} onClick={() => setMode(m.id)} style={{
+                  padding: "7px 14px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer",
+                  border: `1px solid ${on ? ACCENT : LINE}`, background: on ? ACCENT : "#fff", color: on ? "#fff" : INK,
+                }}>{m.label}</button>
+              );
+            })}
+          </div>
+          <div style={{ color: MUTE, fontSize: 12.5, marginTop: 8 }}>{current?.hint}</div>
+
+          {mode === "passphrase" && (
+            <div style={{ marginTop: 12 }}>
+              <label style={lblStyle}>Access phrase</label>
+              <input style={inpStyle} value={passphrase} onChange={(e) => setPassphrase(e.target.value)} placeholder="e.g. ACTIVANT" />
+            </div>
+          )}
+          {mode === "allowlist" && (
+            <div style={{ marginTop: 12 }}>
+              <label style={lblStyle}>Allowed Slack user ids / WhatsApp numbers (one per line)</label>
+              <textarea
+                style={{ ...inpStyle, height: 90, resize: "vertical", fontFamily: "ui-monospace, Menlo, monospace" }}
+                value={allowlist}
+                onChange={(e) => setAllowlist(e.target.value)}
+                placeholder={"U012ABC...\n+14155550123"}
+              />
+            </div>
+          )}
+
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 14 }}>
+            <button onClick={save} style={{ ...primaryBtn, width: "auto", marginTop: 0, padding: "9px 18px" }}>Save</button>
+            {status && <span style={{ fontSize: 12.5, color: status.includes("fail") ? "#b42318" : MUTE }}>{status}</span>}
+          </div>
+        </>
+      )}
     </div>
   );
 }

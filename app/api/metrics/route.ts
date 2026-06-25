@@ -16,6 +16,32 @@ const QUERY_EVENTS: Record<Bot, Set<string>> = {
 
 const WINDOW_DAYS = 30;
 
+// Estimated OpenRouter prices, USD per 1M tokens. Edit as prices change; any
+// model not listed falls back to DEFAULT_PRICE.
+const PRICES: Record<string, { in: number; out: number }> = {
+  "anthropic/claude-sonnet-4-5": { in: 3, out: 15 },
+  "anthropic/claude-3.5-sonnet": { in: 3, out: 15 },
+  "anthropic/claude-3-5-sonnet": { in: 3, out: 15 },
+  "anthropic/claude-haiku-4-5": { in: 1, out: 5 },
+  "anthropic/claude-3.5-haiku": { in: 0.8, out: 4 },
+  "anthropic/claude-opus-4": { in: 15, out: 75 },
+  "openai/gpt-4o": { in: 2.5, out: 10 },
+  "openai/gpt-4o-mini": { in: 0.15, out: 0.6 },
+  "openai/gpt-4.1": { in: 2, out: 8 },
+  "google/gemini-2.5-pro": { in: 1.25, out: 10 },
+  "google/gemini-2.5-flash": { in: 0.3, out: 2.5 },
+};
+const DEFAULT_PRICE = { in: 3, out: 15 };
+
+function eventCost(meta: any): number {
+  if (!meta) return 0;
+  const model = String(meta.model ?? "").toLowerCase();
+  const p = PRICES[model] ?? DEFAULT_PRICE;
+  const pt = Number(meta.prompt_tokens ?? 0);
+  const ct = Number(meta.completion_tokens ?? 0);
+  return (pt / 1e6) * p.in + (ct / 1e6) * p.out;
+}
+
 function dayKey(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
@@ -98,11 +124,11 @@ export async function GET(req: NextRequest) {
   const days = lastNDays(WINDOW_DAYS);
 
   // Pull the event window once, then aggregate per bot in memory.
-  let events: { bot: string; event_type: string; created_at: string }[] = [];
+  let events: { bot: string; event_type: string; created_at: string; metadata: any }[] = [];
   try {
     const { data } = await supabase
       .from("bot_events")
-      .select("bot, event_type, created_at")
+      .select("bot, event_type, created_at, metadata")
       .gte("created_at", since.toISOString())
       .order("created_at", { ascending: false })
       .limit(50000);
@@ -125,6 +151,8 @@ export async function GET(req: NextRequest) {
     const perDayMap = new Map<string, number>();
     let queries30d = 0;
     let queriesToday = 0;
+    let cost30d = 0;
+    let currentModel: string | null = null;
 
     for (const r of rows) {
       byTypeMap.set(r.event_type, (byTypeMap.get(r.event_type) ?? 0) + 1);
@@ -134,15 +162,21 @@ export async function GET(req: NextRequest) {
         queries30d++;
         if (k === today) queriesToday++;
       }
+      if (r.event_type === "llm_usage") {
+        cost30d += eventCost(r.metadata);
+        // rows are newest-first, so the first llm_usage we see is the latest.
+        if (!currentModel && r.metadata?.model) currentModel = String(r.metadata.model);
+      }
     }
 
     const perDay = days.map((d) => ({ date: d, count: perDayMap.get(d) ?? 0 }));
     const byType = [...byTypeMap.entries()]
       .map(([type, count]) => ({ type, count }))
+      .filter((t) => t.type !== "llm_usage")
       .sort((a, b) => b.count - a.count);
     const totalEvents = rows.length;
 
-    return { perDay, byType, queries30d, queriesToday, totalEvents };
+    return { perDay, byType, queries30d, queriesToday, totalEvents, cost30d, currentModel };
   }
 
   const ariaAgg = aggregate("ARIA");
@@ -153,6 +187,8 @@ export async function GET(req: NextRequest) {
     name: "ARIA",
     label: "Research & Investment",
     deployed: true,
+    model: ariaAgg.currentModel || process.env.QA_MODEL?.trim() || "anthropic/claude-sonnet-4-5",
+    cost30d: ariaAgg.cost30d,
     headline: [
       { label: "Subscribed users", value: subscribers },
       { label: "Active channels", value: channels },
@@ -168,6 +204,8 @@ export async function GET(req: NextRequest) {
     name: "APRIL",
     label: "Affinity Pipeline",
     deployed: aprilAgg.totalEvents > 0,
+    model: aprilAgg.currentModel || "—",
+    cost30d: aprilAgg.cost30d,
     headline: [
       { label: "Affinity queries (30d)", value: aprilAgg.queries30d },
       { label: "Queries today", value: aprilAgg.queriesToday },
@@ -181,6 +219,8 @@ export async function GET(req: NextRequest) {
     name: "ARC",
     label: "Public Research (Slack + WhatsApp)",
     deployed: arcAgg.totalEvents > 0,
+    model: arcAgg.currentModel || "—",
+    cost30d: arcAgg.cost30d,
     headline: [
       { label: "Queries (30d)", value: arcAgg.queries30d },
       { label: "Queries today", value: arcAgg.queriesToday },

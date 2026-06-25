@@ -1,4 +1,5 @@
 import { retrieve, listArticleIndex, getArticleChunks, RetrievedChunk } from "@/lib/retrieval";
+import { logLlmUsage } from "@/lib/metrics";
 
 const QA_SYSTEM_PROMPT =
   "You are ARIA, a research assistant for Activant Capital. Answer content questions using ONLY the provided research excerpts; if they don't contain the answer, say you don't have that in the research rather than guessing. You are also given an index of EVERY research article with its publication date, sorted newest first — use the index (not the excerpts) to answer questions about recency, dates, counts, or which articles exist (e.g. 'what's the latest article', 'how many did we publish in 2025'). Article dates are day-level and the index is already ordered newest first, so for 'latest'/'most recent' name the single article at the top — never say two articles are tied or that you can't tell which is newer; if two dates differ at all, the later date is more recent. Be concise and write for a Slack message. Attribute key facts to the article they came from. Use Slack formatting: single asterisks for *bold*, never double asterisks, and no markdown headers.";
@@ -110,6 +111,7 @@ export async function answerQuestion(question: string): Promise<string> {
   };
   const answer = data.choices?.[0]?.message?.content?.trim();
   if (!answer) throw new Error("OpenRouter returned an empty answer");
+  await logLlmUsage("ARIA", model, data);
 
   // Append up to 3 distinct source links from the excerpts used.
   const sources = [
@@ -173,6 +175,7 @@ export async function researchJoke(): Promise<string> {
   const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
   const joke = data.choices?.[0]?.message?.content?.trim();
   if (!joke) throw new Error("OpenRouter returned an empty joke");
+  await logLlmUsage("ARIA", model, data);
 
   // Enforce a single line no matter what the model returns.
   return joke.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] ?? joke;

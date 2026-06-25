@@ -36,3 +36,19 @@ export async function logEvent(
     console.error("logEvent failed:", err);
   }
 }
+
+/**
+ * Log token usage from an OpenRouter response so the dashboard can estimate
+ * model cost. Records the model and token counts; cost is computed centrally
+ * in the metrics API from a price table.
+ */
+export async function logLlmUsage(bot: string, model: string, apiJson: unknown): Promise<void> {
+  const u = (apiJson as { usage?: { prompt_tokens?: number; completion_tokens?: number } })?.usage ?? {};
+  await logEvent(bot, "llm_usage", {
+    metadata: {
+      model,
+      prompt_tokens: Number(u.prompt_tokens ?? 0),
+      completion_tokens: Number(u.completion_tokens ?? 0),
+    },
+  });
+}

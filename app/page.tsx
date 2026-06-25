@@ -20,7 +20,7 @@ type Metrics = { generatedAt: string; windowDays: number; bots: Record<string, B
 const TABS = ["ARIA", "APRIL", "ARC"] as const;
 
 // ── Edit this to change the heading shown at the top of the dashboard ──
-const DASHBOARD_TITLE = "Activant Bot Metrics";
+const DASHBOARD_TITLE = "Bot Metrics";
 
 const ACCENT = "#2f6feb";
 const INK = "#0f1222";
@@ -307,6 +307,7 @@ function ModelControl({
   const [value, setValue] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [models, setModels] = useState<{ id: string; name: string }[]>([]);
 
   function authFetch(url: string, opts: RequestInit = {}) {
     const headers: Record<string, string> = { ...(opts.headers as Record<string, string>) };
@@ -324,6 +325,10 @@ function ModelControl({
         setLoaded(true);
       })
       .catch(() => setLoaded(true));
+    fetch("/api/models", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d) => setModels(Array.isArray(d.models) ? d.models : []))
+      .catch(() => setModels([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bot]);
 
@@ -343,7 +348,7 @@ function ModelControl({
     }
   }
 
-  const COMMON = [
+  const FALLBACK = [
     "anthropic/claude-sonnet-4-5",
     "anthropic/claude-haiku-4-5",
     "anthropic/claude-opus-4",
@@ -353,12 +358,13 @@ function ModelControl({
     "google/gemini-2.5-pro",
     "google/gemini-2.5-flash",
   ];
+  const options = models.length > 0 ? models : FALLBACK.map((id) => ({ id, name: id }));
 
   return (
     <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 12, padding: 18, marginBottom: 12 }}>
       <div style={{ fontSize: 13, fontWeight: 600, color: INK, marginBottom: 4 }}>Model</div>
       <div style={{ fontSize: 12, color: MUTE, marginBottom: 10 }}>
-        Override {bot}&rsquo;s model. Leave blank to use the environment default. Currently in use: <code>{displayedModel}</code>
+        Override {bot}&rsquo;s model — start typing to search OpenRouter&rsquo;s full catalog. Leave blank to use the environment default. Currently in use: <code>{displayedModel}</code>
       </div>
       {!loaded ? (
         <div style={{ color: MUTE, fontSize: 13 }}>Loading…</div>
@@ -372,8 +378,8 @@ function ModelControl({
             placeholder={displayedModel}
           />
           <datalist id={`models-${bot}`}>
-            {COMMON.map((m) => (
-              <option key={m} value={m} />
+            {options.map((m) => (
+              <option key={m.id} value={m.id} label={m.name !== m.id ? m.name : undefined} />
             ))}
           </datalist>
           <button onClick={save} style={{ ...primaryBtn, width: "auto", marginTop: 0, padding: "9px 18px" }}>Save</button>

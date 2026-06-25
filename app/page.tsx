@@ -20,7 +20,7 @@ type Metrics = { generatedAt: string; windowDays: number; bots: Record<string, B
 const TABS = ["ARIA", "APRIL", "ARC"] as const;
 
 // ── Edit this to change the heading shown at the top of the dashboard ──
-const DASHBOARD_TITLE = "Bot Metrics";
+const DASHBOARD_TITLE = "Activant Bot Metrics";
 
 const ACCENT = "#2f6feb";
 const INK = "#0f1222";

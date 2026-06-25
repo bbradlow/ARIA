@@ -19,6 +19,15 @@ function formatDate(d: string | null): string {
 }
 
 /** Answer a question grounded in the research library. Returns Slack-ready text. */
+// Models often write "~" to mean "approximately"; Slack treats tildes as
+// strikethrough, which mangles the message. Neutralize them.
+function sanitizeForChat(s: string): string {
+  return s
+    .replace(/~~/g, "")
+    .replace(/~(?=\s*[\d$£€])/g, "about ")
+    .replace(/~/g, "");
+}
+
 export async function answerQuestion(question: string): Promise<string> {
   const q = (question || "").trim();
   if (!q) {
@@ -110,9 +119,10 @@ export async function answerQuestion(question: string): Promise<string> {
   const data = (await res.json()) as {
     choices?: { message?: { content?: string } }[];
   };
-  const answer = data.choices?.[0]?.message?.content?.trim();
-  if (!answer) throw new Error("OpenRouter returned an empty answer");
+  const raw = data.choices?.[0]?.message?.content?.trim();
+  if (!raw) throw new Error("OpenRouter returned an empty answer");
   await logLlmUsage("ARIA", model, data);
+  const answer = sanitizeForChat(raw);
 
   // Append up to 3 distinct source links from the excerpts used.
   const sources = [
@@ -179,5 +189,5 @@ export async function researchJoke(): Promise<string> {
   await logLlmUsage("ARIA", model, data);
 
   // Enforce a single line no matter what the model returns.
-  return joke.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] ?? joke;
+  return sanitizeForChat(joke.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0] ?? joke);
 }

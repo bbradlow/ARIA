@@ -4,7 +4,7 @@ import { getSupabase } from "@/lib/supabase";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const BOTS = ["ARIA", "APRIL", "ARC"];
+const BOTS = ["ARIA", "APRIL", "ARC", "APRIL_CALL"];
 
 async function isAuthorized(req: NextRequest): Promise<boolean> {
   const token = req.nextUrl.searchParams.get("token");
